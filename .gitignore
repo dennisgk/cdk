@@ -17,6 +17,7 @@ dist/
 # Environment / local config
 .env
 .env.*
+!.env.example
 
 # Local app state
 cdk-python/cdk.sqlite3
