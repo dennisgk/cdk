@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from .config import get_config, load_config
+from .db import BASE_DIR
 from .db import Database
 from .memory_palaces import MemoryPalaceManager, MemoryPalaceStore
 from .pipelines import PipelineManager, RoutineTaskPipelineFacade
@@ -35,6 +37,7 @@ routine_task_manager = RoutineTaskManager(
     config,
 )
 memory_palace_manager = MemoryPalaceManager(MemoryPalaceStore(database))
+STATIC_DIR = BASE_DIR / "static"
 
 
 @asynccontextmanager
@@ -180,3 +183,24 @@ async def call_routine_task_remote_handler(
         subject,
         remote_path,
     )
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str) -> Response:
+    if not STATIC_DIR.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Static app not found.")
+
+    static_root = STATIC_DIR.resolve()
+    requested = (STATIC_DIR / full_path).resolve()
+
+    if not str(requested).startswith(str(static_root)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
+
+    if full_path and requested.is_file():
+        return FileResponse(requested)
+
+    index_path = STATIC_DIR / "index.html"
+    if index_path.is_file():
+        return FileResponse(index_path)
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="index.html not found.")
