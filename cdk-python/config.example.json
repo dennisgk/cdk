@@ -1,0 +1,23 @@
+{
+  "jwt_secret": "replace-this-with-a-long-random-secret",
+  "jwt_algorithm": "HS256",
+  "access_token_expire_minutes": 480,
+  "password_hash": "$argon2i$v=19$m=16,t=2,p=1$NnZpVHJaaEhUZWx3UEtBNg$OhrvxnLNpQsjMQ2LMrl0Lg",
+  "cors_allowed_origins": [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+  ],
+  "llm": {
+    "host": "https://vllm.kountouris.org",
+    "api_key": "replace-this-with-your-vllm-api-key",
+    "model": "Qwen/Qwen3.5-4B"
+  },
+  "pipelines": [
+    {
+      "name": "gpu_heavy",
+      "category": "gpu_or_heavy_compute",
+      "max_concurrency": 1,
+      "description": "Serialized queue for vLLM and other heavy CPU/GPU workloads."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Environment / local config
+.env
+.env.*
+
+# Local app state
+cdk-python/cdk.sqlite3
+cdk-python/data/
+cdk-python/config.json
+
+# Generated testing artifacts
+testing/
