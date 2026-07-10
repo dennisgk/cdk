@@ -12,10 +12,15 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import {
   Box,
+  ChevronRight,
   Circle,
   Compass,
+  Cone,
   Crosshair,
+  Cylinder,
   Expand,
+  FileUp,
+  Globe,
   Minus,
   Move,
   Pencil,
@@ -23,9 +28,14 @@ import {
   Plus,
   RotateCw,
   Shapes,
+  Torus,
 } from 'lucide-react'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import {
+  Box3,
   BufferAttribute,
   BufferGeometry,
   CanvasTexture,
@@ -36,8 +46,11 @@ import {
   Matrix3,
   Matrix4,
   MOUSE,
+  Mesh,
   MeshBasicMaterial,
+  MeshStandardMaterial,
   NearestFilter,
+  type Object3D,
   OrthographicCamera,
   Plane,
   PerspectiveCamera,
@@ -61,7 +74,6 @@ const TWO_FINGER_TAP_MAX_MOVE = 12
 const TWO_FINGER_PAN_REARM_MS = 450
 const MAX_DEBUG_LOGS = 250
 const DEGREES_PER_RADIAN = 180 / Math.PI
-const SCENE_GRID_SIZE = 10
 
 type ToolKind =
   | 'fake'
@@ -117,14 +129,30 @@ type TransformableProperties = {
   scale: [number, number, number]
 }
 
+type MeshPrimitiveKind = 'cube' | 'sphere' | 'cylinder' | 'cone' | 'torus'
+type ImportFormat = 'stl' | 'glb' | 'fbx'
+
 type MeshSceneObject = {
   id: string
   objectType: 'Mesh'
-  primitiveType: 'cube'
+  primitiveType: MeshPrimitiveKind
   name: string
 } & TransformableProperties & {
   mesh: {
     color: string
+  }
+}
+
+type ImportedModelSceneObject = {
+  id: string
+  objectType: 'STL Import' | 'GLB Import' | 'FBX Import'
+  primitiveType: 'imported-model'
+  name: string
+} & TransformableProperties & {
+  importedModel: {
+    format: ImportFormat
+    fileName: string
+    object3d: Group
   }
 }
 
@@ -152,6 +180,9 @@ type SelectedSurfaceSceneObject = {
   }
 }
 
+type FloorCellState = 'flat' | 'mount' | 'empty'
+type FloorMountDirection = 'left' | 'right' | 'up' | 'down'
+
 type FloorSceneObject = {
   id: string
   objectType: 'Floor'
@@ -159,6 +190,8 @@ type FloorSceneObject = {
   name: string
   floor: {
     height: number
+    cells: FloorCellState[][]
+    mountDirection: FloorMountDirection
   }
 }
 
@@ -180,6 +213,7 @@ type TransformableSceneObject =
   | MeshSceneObject
   | DrawnSurfaceSceneObject
   | SelectedSurfaceSceneObject
+  | ImportedModelSceneObject
 type SceneObject = TransformableSceneObject | FloorSceneObject | PenSceneObject
 
 type DrawnSurfaceDraft = {
@@ -206,13 +240,98 @@ type PenDraft = {
   strokes: [number, number, number][][]
 }
 
+const FLOOR_GRID_CELLS = 10
+const FLOOR_CELL_CENTER_OFFSET = (FLOOR_GRID_CELLS - 1) / 2
+// New floors start as a 2x2 flat patch in the middle of the paintable 10x10 area.
+const FLOOR_DEFAULT_FLAT_CELLS = 2
+
+const createDefaultFloorCells = (): FloorCellState[][] => {
+  const start = (FLOOR_GRID_CELLS - FLOOR_DEFAULT_FLAT_CELLS) / 2
+  const end = start + FLOOR_DEFAULT_FLAT_CELLS
+  return Array.from({ length: FLOOR_GRID_CELLS }, (_, row) =>
+    Array.from({ length: FLOOR_GRID_CELLS }, (_, column) =>
+      row >= start && row < end && column >= start && column < end
+        ? ('flat' as FloorCellState)
+        : ('empty' as FloorCellState),
+    ),
+  )
+}
+
+// Grid columns run left→right along +x; grid rows run top→bottom along +z
+// (so "up" on the 2d grid is -z, matching the mount direction mapping).
+const floorCellToWorld = (row: number, column: number): [number, number] => [
+  column - FLOOR_CELL_CENTER_OFFSET,
+  row - FLOOR_CELL_CENTER_OFFSET,
+]
+
+// Mount directions map to world axes: right +x, left -x, up -z, down +z.
+const FLOOR_MOUNT_DIRECTION_ROTATIONS: Record<
+  FloorMountDirection,
+  [number, number, number]
+> = {
+  right: [0, 0, -Math.PI / 2],
+  left: [0, 0, Math.PI / 2],
+  up: [-Math.PI / 2, 0, 0],
+  down: [Math.PI / 2, 0, 0],
+}
+
+const FLOOR_FLAT_COLOR = '#c6d8cb'
+const FLOOR_MOUNT_COLOR = '#c2b3dd'
+
+const MESH_PRIMITIVES: Array<{
+  kind: MeshPrimitiveKind
+  label: string
+  icon: typeof Box
+}> = [
+  { kind: 'cube', label: 'Cube', icon: Box },
+  { kind: 'sphere', label: 'Sphere', icon: Globe },
+  { kind: 'cylinder', label: 'Cylinder', icon: Cylinder },
+  { kind: 'cone', label: 'Cone', icon: Cone },
+  { kind: 'torus', label: 'Torus', icon: Torus },
+]
+
+const MESH_PRIMITIVE_LABELS = Object.fromEntries(
+  MESH_PRIMITIVES.map((entry) => [entry.kind, entry.label]),
+) as Record<MeshPrimitiveKind, string>
+
+const IMPORT_FORMAT_DETAILS: Record<
+  ImportFormat,
+  { objectType: ImportedModelSceneObject['objectType']; accept: string }
+> = {
+  stl: { objectType: 'STL Import', accept: '.stl' },
+  glb: { objectType: 'GLB Import', accept: '.glb' },
+  fbx: { objectType: 'FBX Import', accept: '.fbx' },
+}
+
+// Imported files arrive in arbitrary units (FBX is often centimeters), so wrap
+// them in a container scaled to a ~2 unit footprint with the bounding-box
+// bottom center at the object origin, matching the bottom-anchored primitives.
+const normalizeImportedModel = (model: Object3D) => {
+  const container = new Group()
+  container.add(model)
+  const bounds = new Box3().setFromObject(model)
+  if (!bounds.isEmpty()) {
+    const size = bounds.getSize(new Vector3())
+    const maxDimension = Math.max(size.x, size.y, size.z)
+    const scale = maxDimension > 1e-6 ? 2 / maxDimension : 1
+    container.scale.setScalar(scale)
+    container.position.set(
+      (-(bounds.min.x + bounds.max.x) / 2) * scale,
+      -bounds.min.y * scale,
+      (-(bounds.min.z + bounds.max.z) / 2) * scale,
+    )
+  }
+  return container
+}
+
 const radiansToDegrees = (value: number) => value * DEGREES_PER_RADIAN
 const degreesToRadians = (value: number) => value / DEGREES_PER_RADIAN
 
 const isTransformableObject = (object: SceneObject): object is TransformableSceneObject =>
-  object.primitiveType === 'cube' ||
+  object.objectType === 'Mesh' ||
   object.primitiveType === 'drawn-surface' ||
-  object.primitiveType === 'selected-surface'
+  object.primitiveType === 'selected-surface' ||
+  object.primitiveType === 'imported-model'
 
 const isProjectionSurfaceObject = (
   object: SceneObject | null | undefined,
@@ -1443,22 +1562,54 @@ function SceneObjects({
           return null
         }
 
-        if (object.primitiveType === 'cube') {
+        if (object.objectType === 'Mesh') {
           return (
-            <mesh
+            <group
               key={object.id}
               position={object.position}
               rotation={object.rotation}
               scale={object.scale}
-              userData={{ sceneObjectId: object.id }}
             >
-              <boxGeometry args={[1.2, 1.2, 1.2]} />
-              <meshStandardMaterial
-                color={selectedIds.has(object.id) ? '#7fd68f' : object.mesh.color}
-                roughness={0.82}
-                metalness={0.08}
-              />
-            </mesh>
+              {/* Geometry is raised so the object origin sits at the bottom:
+                  position y = 0 rests the primitive on the floor. */}
+              <mesh
+                position={[0, object.primitiveType === 'torus' ? 0.15 : 0.5, 0]}
+                rotation={
+                  object.primitiveType === 'torus' ? [-Math.PI / 2, 0, 0] : [0, 0, 0]
+                }
+                userData={{ sceneObjectId: object.id }}
+              >
+                {object.primitiveType === 'cube' ? <boxGeometry args={[1, 1, 1]} /> : null}
+                {object.primitiveType === 'sphere' ? (
+                  <sphereGeometry args={[0.5, 32, 16]} />
+                ) : null}
+                {object.primitiveType === 'cylinder' ? (
+                  <cylinderGeometry args={[0.5, 0.5, 1, 32]} />
+                ) : null}
+                {object.primitiveType === 'cone' ? <coneGeometry args={[0.5, 1, 32]} /> : null}
+                {object.primitiveType === 'torus' ? (
+                  <torusGeometry args={[0.35, 0.15, 16, 48]} />
+                ) : null}
+                <meshStandardMaterial
+                  color={selectedIds.has(object.id) ? '#7fd68f' : object.mesh.color}
+                  roughness={0.82}
+                  metalness={0.08}
+                />
+              </mesh>
+            </group>
+          )
+        }
+
+        if (object.primitiveType === 'imported-model') {
+          return (
+            <group
+              key={object.id}
+              position={object.position}
+              rotation={object.rotation}
+              scale={object.scale}
+            >
+              <primitive object={object.importedModel.object3d} />
+            </group>
           )
         }
 
@@ -1548,18 +1699,49 @@ function SceneObjects({
 
         return (
           <group key={object.id}>
-            <mesh position={[0, -object.floor.height / 2, 0]} receiveShadow>
-              <boxGeometry args={[SCENE_GRID_SIZE, object.floor.height, SCENE_GRID_SIZE]} />
-              <meshStandardMaterial color="#c6d8cb" roughness={0.92} metalness={0.02} />
-            </mesh>
-            <mesh
-              position={[0, 0.001, 0]}
-              rotation={[-Math.PI / 2, 0, 0]}
-              receiveShadow
-            >
-              <planeGeometry args={[SCENE_GRID_SIZE, SCENE_GRID_SIZE]} />
-              <FloorGridMaterial selected={selectedIds.has(object.id)} />
-            </mesh>
+            {object.floor.cells.map((cellRow, rowIndex) =>
+              cellRow.map((cell, columnIndex) => {
+                if (cell === 'empty') {
+                  return null
+                }
+                const [cellX, cellZ] = floorCellToWorld(rowIndex, columnIndex)
+                return (
+                  <group key={`${object.id}-${rowIndex}-${columnIndex}`}>
+                    <mesh
+                      position={[cellX, -object.floor.height / 2, cellZ]}
+                      receiveShadow
+                    >
+                      <boxGeometry args={[1, object.floor.height, 1]} />
+                      <meshStandardMaterial
+                        color={cell === 'mount' ? FLOOR_MOUNT_COLOR : FLOOR_FLAT_COLOR}
+                        roughness={0.92}
+                        metalness={0.02}
+                      />
+                    </mesh>
+                    <mesh
+                      position={[cellX, 0.001, cellZ]}
+                      rotation={[-Math.PI / 2, 0, 0]}
+                      receiveShadow
+                    >
+                      <planeGeometry args={[1, 1]} />
+                      <FloorGridMaterial
+                        selected={selectedIds.has(object.id)}
+                        mount={cell === 'mount'}
+                      />
+                    </mesh>
+                    {cell === 'mount' ? (
+                      <mesh
+                        position={[cellX, 0.12, cellZ]}
+                        rotation={FLOOR_MOUNT_DIRECTION_ROTATIONS[object.floor.mountDirection]}
+                      >
+                        <coneGeometry args={[0.1, 0.32, 12]} />
+                        <meshStandardMaterial color="#8656d9" emissive="#2a1747" />
+                      </mesh>
+                    ) : null}
+                  </group>
+                )
+              }),
+            )}
           </group>
         )
       })}
@@ -2035,8 +2217,10 @@ function PenDraftOverlay({
 
 function FloorGridMaterial({
   selected,
+  mount = false,
 }: {
   selected: boolean
+  mount?: boolean
 }) {
   const materialRef = useRef<ShaderMaterial | null>(null)
   const { camera } = useThree()
@@ -2044,16 +2228,18 @@ function FloorGridMaterial({
   const uniforms = useMemo(
     () => ({
       uBaseColor: {
-        value: new Vector3(
-          ...(selected ? [0.498, 0.839, 0.561] : [0.68, 0.78, 0.71]),
-        ),
+        value: selected
+          ? new Vector3(0.498, 0.839, 0.561)
+          : mount
+            ? new Vector3(0.74, 0.67, 0.87)
+            : new Vector3(0.68, 0.78, 0.71),
       },
       uMinorColor: { value: new Vector3(0.72, 0.72, 0.72) },
       uMediumColor: { value: new Vector3(0.43, 0.43, 0.43) },
       uMajorColor: { value: new Vector3(0.12, 0.12, 0.12) },
       uCameraPosition: { value: new Vector3() },
     }),
-    [selected],
+    [mount, selected],
   )
 
   useEffect(() => {
@@ -2063,9 +2249,11 @@ function FloorGridMaterial({
 
     const nextBaseColor = selected
       ? new Vector3(0.498, 0.839, 0.561)
-      : new Vector3(0.68, 0.78, 0.71)
+      : mount
+        ? new Vector3(0.74, 0.67, 0.87)
+        : new Vector3(0.68, 0.78, 0.71)
     materialRef.current.uniforms.uBaseColor.value.copy(nextBaseColor)
-  }, [selected])
+  }, [mount, selected])
 
   useFrame(() => {
     materialRef.current?.uniforms.uCameraPosition.value.copy(camera.position)
@@ -2522,6 +2710,7 @@ export function MemoryPalaceViewPage() {
       ? objects.find((object) => selectedIds.has(object.id)) ?? null
       : null
   const penAddEnabled = sceneMode === 'general' && isProjectionSurfaceObject(selectedProjectionSurface)
+  const hasFloor = objects.some((object) => object.primitiveType === 'floor')
   const sceneListEntries = useMemo(() => {
     const topLevel = objects.filter((object) => object.primitiveType !== 'pen')
     const penChildren = objects.filter(
@@ -2561,6 +2750,7 @@ export function MemoryPalaceViewPage() {
   }, [objects, penProjectionSurfaceId])
 
   const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [addSubmenu, setAddSubmenu] = useState<'primitives' | 'import' | null>(null)
   const { refs, floatingStyles, context } = useFloating({
     open: addMenuOpen,
     onOpenChange: setAddMenuOpen,
@@ -2571,6 +2761,14 @@ export function MemoryPalaceViewPage() {
   const click = useClick(context)
   const dismiss = useDismiss(context)
   const { getReferenceProps, getFloatingProps } = useInteractions([click, dismiss])
+  const importFileInputRef = useRef<HTMLInputElement | null>(null)
+  const pendingImportFormatRef = useRef<ImportFormat | null>(null)
+
+  useEffect(() => {
+    if (!addMenuOpen) {
+      setAddSubmenu(null)
+    }
+  }, [addMenuOpen])
 
   const [sceneContextMenu, setSceneContextMenu] = useState<{
     objectId: string
@@ -2597,6 +2795,69 @@ export function MemoryPalaceViewPage() {
   const { getFloatingProps: getSceneContextMenuFloatingProps } = useInteractions([
     dismissSceneContextMenu,
   ])
+
+  const [floorGridEditor, setFloorGridEditor] = useState<{
+    objectId: string
+    x: number
+    y: number
+  } | null>(null)
+  const [floorGridTool, setFloorGridTool] = useState<'eraser' | 'mount' | 'flat'>('flat')
+  const floorGridPaintingRef = useRef(false)
+  const {
+    refs: floorGridRefs,
+    floatingStyles: floorGridStyles,
+    context: floorGridContext,
+  } = useFloating({
+    open: floorGridEditor !== null,
+    onOpenChange: (open) => {
+      if (!open) {
+        setFloorGridEditor(null)
+      }
+    },
+    placement: 'right-start',
+    strategy: 'fixed',
+    whileElementsMounted: autoUpdate,
+    middleware: [offset(4), flip(), shift({ padding: 8 })],
+  })
+  const dismissFloorGrid = useDismiss(floorGridContext)
+  const { getFloatingProps: getFloorGridFloatingProps } = useInteractions([
+    dismissFloorGrid,
+  ])
+  const floorGridObject =
+    floorGridEditor !== null
+      ? objects.find(
+          (object): object is FloorSceneObject =>
+            object.primitiveType === 'floor' && object.id === floorGridEditor.objectId,
+        ) ?? null
+      : null
+
+  useEffect(() => {
+    if (!floorGridEditor) {
+      return
+    }
+
+    floorGridRefs.setPositionReference({
+      getBoundingClientRect: () =>
+        DOMRect.fromRect({
+          x: floorGridEditor.x,
+          y: floorGridEditor.y,
+          width: 0,
+          height: 0,
+        }),
+    })
+  }, [floorGridEditor, floorGridRefs])
+
+  useEffect(() => {
+    const stopPainting = () => {
+      floorGridPaintingRef.current = false
+    }
+    window.addEventListener('pointerup', stopPainting)
+    window.addEventListener('pointercancel', stopPainting)
+    return () => {
+      window.removeEventListener('pointerup', stopPainting)
+      window.removeEventListener('pointercancel', stopPainting)
+    }
+  }, [])
 
   const appendDebugLog = useCallback((message: string) => {
     setDebugLogs((current) => {
@@ -2815,17 +3076,20 @@ export function MemoryPalaceViewPage() {
     }
   }, [decodedName])
 
-  const addCube = () => {
-    const nextNumber = objects.length + 1
+  const addPrimitive = (kind: MeshPrimitiveKind) => {
+    const nextNumber =
+      objects.filter(
+        (object) => object.objectType === 'Mesh' && object.primitiveType === kind,
+      ).length + 1
     const column = (objects.length % 4) - 1.5
     const row = Math.floor(objects.length / 4)
     const nextId = createSceneObjectId(new Set(objects.map((object) => object.id)))
     const nextObject: SceneObject = {
       id: nextId,
       objectType: 'Mesh',
-      primitiveType: 'cube',
-      name: `Cube ${nextNumber}`,
-      position: [column * 1.8, 0.6, -row * 1.8],
+      primitiveType: kind,
+      name: `${MESH_PRIMITIVE_LABELS[kind]} ${nextNumber}`,
+      position: [column * 1.8, 0, -row * 1.8],
       rotation: [0, 0, 0],
       scale: [1, 1, 1],
       mesh: {
@@ -2837,7 +3101,96 @@ export function MemoryPalaceViewPage() {
     setAddMenuOpen(false)
   }
 
+  const startImport = (format: ImportFormat) => {
+    const input = importFileInputRef.current
+    if (!input) {
+      return
+    }
+    pendingImportFormatRef.current = format
+    input.accept = IMPORT_FORMAT_DETAILS[format].accept
+    input.click()
+    setAddMenuOpen(false)
+  }
+
+  const finishImport = (format: ImportFormat, fileName: string, model: Object3D) => {
+    const details = IMPORT_FORMAT_DETAILS[format]
+    const container = normalizeImportedModel(model)
+    const nextNumber =
+      objects.filter(
+        (object) =>
+          object.primitiveType === 'imported-model' &&
+          object.importedModel.format === format,
+      ).length + 1
+    const nextId = createSceneObjectId(new Set(objects.map((object) => object.id)))
+    const nextObject: ImportedModelSceneObject = {
+      id: nextId,
+      objectType: details.objectType,
+      primitiveType: 'imported-model',
+      name: `${details.objectType} ${nextNumber}`,
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      importedModel: {
+        format,
+        fileName,
+        object3d: container,
+      },
+    }
+    setObjects((current) => [...current, nextObject])
+    setSelectedIds(new Set([nextId]))
+    setPropertiesTab('general')
+    appendDebugLog(`[import] ${fileName} added as ${nextObject.name}`)
+  }
+
+  const handleImportFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const format = pendingImportFormatRef.current
+    const input = event.target
+    const file = input.files?.[0] ?? null
+    input.value = ''
+    pendingImportFormatRef.current = null
+    if (!format || !file) {
+      return
+    }
+    try {
+      const buffer = await file.arrayBuffer()
+      if (format === 'stl') {
+        const geometry = new STLLoader().parse(buffer)
+        if (!geometry.getAttribute('normal')) {
+          geometry.computeVertexNormals()
+        }
+        finishImport(
+          format,
+          file.name,
+          new Mesh(
+            geometry,
+            new MeshStandardMaterial({
+              color: '#b8c4cc',
+              roughness: 0.78,
+              metalness: 0.12,
+            }),
+          ),
+        )
+      } else if (format === 'glb') {
+        const gltf = await new GLTFLoader().parseAsync(buffer, '')
+        finishImport(format, file.name, gltf.scene)
+      } else {
+        finishImport(format, file.name, new FBXLoader().parse(buffer, ''))
+      }
+    } catch (importError) {
+      appendDebugLog(
+        `[import] ${format} import of ${file.name} failed: ${
+          importError instanceof Error ? importError.message : 'unknown error'
+        }`,
+      )
+    }
+  }
+
   const addFloor = () => {
+    if (hasFloor) {
+      return
+    }
     const nextId = createSceneObjectId(new Set(objects.map((object) => object.id)))
     const nextObject: SceneObject = {
       id: nextId,
@@ -2846,6 +3199,8 @@ export function MemoryPalaceViewPage() {
       name: 'Floor',
       floor: {
         height: 0.2,
+        cells: createDefaultFloorCells(),
+        mountDirection: 'right',
       },
     }
     setObjects((current) => [...current, nextObject])
@@ -3224,11 +3579,11 @@ export function MemoryPalaceViewPage() {
   }
 
   const updateSelectedObjectMeshColor = (value: string) => {
-    if (!selectedObject || selectedObject.primitiveType !== 'cube') {
+    if (!selectedObject || selectedObject.objectType !== 'Mesh') {
       return
     }
     updateObject(selectedObject.id, (object) => {
-      if (object.primitiveType !== 'cube') {
+      if (object.objectType !== 'Mesh') {
         return object
       }
       return {
@@ -3292,7 +3647,7 @@ export function MemoryPalaceViewPage() {
   }
 
   const availablePropertyTabs: Array<'general' | 'mesh' | 'floor' | 'pen'> = ['general']
-  if (selectedObject?.primitiveType === 'cube') {
+  if (selectedObject?.objectType === 'Mesh') {
     availablePropertyTabs.push('mesh')
   }
   if (selectedObject?.primitiveType === 'floor') {
@@ -3424,6 +3779,65 @@ export function MemoryPalaceViewPage() {
     })
   }
 
+  const paintFloorGridCell = (row: number, column: number) => {
+    if (!floorGridEditor) {
+      return
+    }
+    const nextState: FloorCellState =
+      floorGridTool === 'eraser' ? 'empty' : floorGridTool === 'mount' ? 'mount' : 'flat'
+    updateObject(floorGridEditor.objectId, (object) => {
+      if (object.primitiveType !== 'floor') {
+        return object
+      }
+      if (object.floor.cells[row]?.[column] === nextState) {
+        return object
+      }
+      return {
+        ...object,
+        floor: {
+          ...object.floor,
+          cells: object.floor.cells.map((cellRow, rowIndex) =>
+            rowIndex === row
+              ? cellRow.map((cell, columnIndex) =>
+                  columnIndex === column ? nextState : cell,
+                )
+              : cellRow,
+          ),
+        },
+      }
+    })
+  }
+
+  const updateFloorMountDirection = (direction: FloorMountDirection) => {
+    if (!floorGridEditor) {
+      return
+    }
+    updateObject(floorGridEditor.objectId, (object) => {
+      if (object.primitiveType !== 'floor') {
+        return object
+      }
+      return {
+        ...object,
+        floor: {
+          ...object.floor,
+          mountDirection: direction,
+        },
+      }
+    })
+  }
+
+  const openFloorGridEditor = () => {
+    if (!sceneContextMenu) {
+      return
+    }
+    setFloorGridEditor({
+      objectId: sceneContextMenu.objectId,
+      x: sceneContextMenu.x,
+      y: sceneContextMenu.y,
+    })
+    closeSceneContextMenu()
+  }
+
   const moveObject = (objectId: string, direction: -1 | 1) => {
     setObjects((current) => {
       const index = current.findIndex((object) => object.id === objectId)
@@ -3449,6 +3863,9 @@ export function MemoryPalaceViewPage() {
       next.delete(objectId)
       return next
     })
+    setFloorGridEditor((current) =>
+      current?.objectId === objectId ? null : current,
+    )
     closeSceneContextMenu()
   }
 
@@ -3456,6 +3873,8 @@ export function MemoryPalaceViewPage() {
     sceneContextMenu === null
       ? -1
       : objects.findIndex((object) => object.id === sceneContextMenu.objectId)
+  const contextMenuObject =
+    contextMenuObjectIndex === -1 ? null : objects[contextMenuObjectIndex]
 
   useEffect(() => {
     if (!sceneContextMenu) {
@@ -3537,6 +3956,12 @@ export function MemoryPalaceViewPage() {
 
   return (
     <div className="relative flex h-full min-h-full w-full flex-col">
+      <input
+        ref={importFileInputRef}
+        type="file"
+        className="hidden"
+        onChange={handleImportFileChange}
+      />
       <div className="pointer-events-none absolute top-2 right-2 z-10">
         <div className="mb-2 flex justify-end">
           <div className="flex h-24 w-24 items-center justify-center border border-border bg-background/85 backdrop-blur">
@@ -3577,18 +4002,75 @@ export function MemoryPalaceViewPage() {
               className="z-20 min-w-36 border border-border bg-popover p-1 shadow-lg"
               {...getFloatingProps()}
             >
+              <div className="relative">
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
+                  onClick={() =>
+                    setAddSubmenu((current) =>
+                      current === 'primitives' ? null : 'primitives',
+                    )
+                  }
+                >
+                  <span className="flex items-center gap-2">
+                    <Box className="size-4" />
+                    Primitives
+                  </span>
+                  <ChevronRight className="size-4" />
+                </button>
+                {addSubmenu === 'primitives' ? (
+                  <div className="absolute top-0 left-full z-30 ml-1 min-w-36 border border-border bg-popover p-1 shadow-lg">
+                    {MESH_PRIMITIVES.map((entry) => (
+                      <button
+                        key={entry.kind}
+                        type="button"
+                        className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
+                        onClick={() => addPrimitive(entry.kind)}
+                      >
+                        <entry.icon className="size-4" />
+                        {entry.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+              <div className="relative">
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
+                  onClick={() =>
+                    setAddSubmenu((current) => (current === 'import' ? null : 'import'))
+                  }
+                >
+                  <span className="flex items-center gap-2">
+                    <FileUp className="size-4" />
+                    Import
+                  </span>
+                  <ChevronRight className="size-4" />
+                </button>
+                {addSubmenu === 'import' ? (
+                  <div className="absolute top-0 left-full z-30 ml-1 min-w-36 border border-border bg-popover p-1 shadow-lg">
+                    {(['stl', 'glb', 'fbx'] as const).map((format) => (
+                      <button
+                        key={format}
+                        type="button"
+                        className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
+                        onClick={() => startImport(format)}
+                      >
+                        <FileUp className="size-4" />
+                        {IMPORT_FORMAT_DETAILS[format].objectType}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               <button
                 type="button"
-                className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
-                onClick={addCube}
-              >
-                <Box className="size-4" />
-                Cube
-              </button>
-              <button
-                type="button"
-                className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-muted"
+                className={`flex w-full items-center gap-2 px-2 py-1 text-left text-sm ${
+                  hasFloor ? 'cursor-not-allowed opacity-40' : 'hover:bg-muted'
+                }`}
                 onClick={addFloor}
+                disabled={hasFloor}
               >
                 <Minus className="size-4" />
                 Floor
@@ -3659,6 +4141,15 @@ export function MemoryPalaceViewPage() {
               className="z-30 min-w-36 border border-border bg-popover p-1 shadow-lg"
               {...getSceneContextMenuFloatingProps()}
             >
+              {contextMenuObject?.primitiveType === 'floor' ? (
+                <button
+                  type="button"
+                  className="flex w-full items-center px-2 py-1 text-left text-sm hover:bg-muted disabled:text-muted-foreground"
+                  onClick={openFloorGridEditor}
+                >
+                  Grid
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="flex w-full items-center px-2 py-1 text-left text-sm hover:bg-muted disabled:text-muted-foreground"
@@ -3685,6 +4176,110 @@ export function MemoryPalaceViewPage() {
               >
                 Move Down
               </button>
+            </div>
+          ) : null}
+
+          {floorGridEditor && floorGridObject ? (
+            <div
+              ref={floorGridRefs.setFloating}
+              style={floorGridStyles}
+              className="z-30 w-72 border border-border bg-popover p-2 shadow-lg"
+              {...getFloorGridFloatingProps()}
+            >
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">{floorGridObject.name} Grid</div>
+                <button
+                  type="button"
+                  className="text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => setFloorGridEditor(null)}
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="mb-2 grid grid-cols-3 gap-2">
+                {(
+                  [
+                    { id: 'eraser', label: 'Eraser' },
+                    { id: 'mount', label: 'Mount Point' },
+                    { id: 'flat', label: 'Flat' },
+                  ] as const
+                ).map((tool) => (
+                  <button
+                    key={tool.id}
+                    type="button"
+                    className={`h-8 border px-1 text-xs ${
+                      floorGridTool === tool.id
+                        ? 'border-primary text-foreground'
+                        : 'border-border text-muted-foreground'
+                    }`}
+                    onClick={() => setFloorGridTool(tool.id)}
+                  >
+                    {tool.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mb-2">
+                <div className="mb-1 text-xs text-muted-foreground">Mount Direction</div>
+                <div className="grid grid-cols-4 gap-2">
+                  {(['left', 'right', 'up', 'down'] as const).map((direction) => (
+                    <button
+                      key={direction}
+                      type="button"
+                      className={`h-8 border px-1 text-xs capitalize ${
+                        floorGridObject.floor.mountDirection === direction
+                          ? 'border-primary text-foreground'
+                          : 'border-border text-muted-foreground'
+                      }`}
+                      onClick={() => updateFloorMountDirection(direction)}
+                    >
+                      {direction}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div
+                className="grid gap-px border border-border bg-border p-px"
+                style={{
+                  touchAction: 'none',
+                  gridTemplateColumns: `repeat(${
+                    floorGridObject.floor.cells[0]?.length ?? FLOOR_GRID_CELLS
+                  }, minmax(0, 1fr))`,
+                }}
+              >
+                {floorGridObject.floor.cells.map((cellRow, rowIndex) =>
+                  cellRow.map((cell, columnIndex) => (
+                    <button
+                      key={`${rowIndex}-${columnIndex}`}
+                      type="button"
+                      className="aspect-square w-full"
+                      style={{
+                        backgroundColor:
+                          cell === 'empty'
+                            ? 'transparent'
+                            : cell === 'mount'
+                              ? FLOOR_MOUNT_COLOR
+                              : FLOOR_FLAT_COLOR,
+                      }}
+                      onPointerDown={(event) => {
+                        event.preventDefault()
+                        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                          event.currentTarget.releasePointerCapture(event.pointerId)
+                        }
+                        floorGridPaintingRef.current = true
+                        paintFloorGridCell(rowIndex, columnIndex)
+                      }}
+                      onPointerEnter={() => {
+                        if (floorGridPaintingRef.current) {
+                          paintFloorGridCell(rowIndex, columnIndex)
+                        }
+                      }}
+                    />
+                  )),
+                )}
+              </div>
             </div>
           ) : null}
         </div>
@@ -3957,7 +4552,7 @@ export function MemoryPalaceViewPage() {
               </>
             ) : null}
 
-            {propertiesTab === 'mesh' && selectedObject.primitiveType === 'cube' ? (
+            {propertiesTab === 'mesh' && selectedObject.objectType === 'Mesh' ? (
               <div>
                 <div className="mb-1 text-xs text-muted-foreground">Color</div>
                 <input

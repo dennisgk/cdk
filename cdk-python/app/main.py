@@ -96,17 +96,25 @@ def get_pipeline_telemetry(_: str = Depends(get_current_subject)) -> dict:
 
 
 @app.get("/api/memory-palaces", response_model=list[MemoryPalaceListItem])
-def list_memory_palaces() -> list[MemoryPalaceListItem]:
+def list_memory_palaces(
+    _: str = Depends(get_current_subject),
+) -> list[MemoryPalaceListItem]:
     return memory_palace_manager.list_memory_palaces()
 
 
 @app.post("/api/memory-palaces", response_model=MemoryPalaceRecord)
-def create_memory_palace(payload: MemoryPalaceCreate) -> MemoryPalaceRecord:
+def create_memory_palace(
+    payload: MemoryPalaceCreate,
+    _: str = Depends(get_current_subject),
+) -> MemoryPalaceRecord:
     return memory_palace_manager.create_memory_palace(payload)
 
 
 @app.get("/api/memory-palaces/{name}", response_model=MemoryPalaceRecord)
-def get_memory_palace(name: str) -> MemoryPalaceRecord:
+def get_memory_palace(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> MemoryPalaceRecord:
     return memory_palace_manager.get_memory_palace(name)
 
 
@@ -114,28 +122,40 @@ def get_memory_palace(name: str) -> MemoryPalaceRecord:
 def update_memory_palace(
     name: str,
     payload: MemoryPalaceUpdate,
+    _: str = Depends(get_current_subject),
 ) -> MemoryPalaceRecord:
     return memory_palace_manager.update_memory_palace(name, payload)
 
 
 @app.delete("/api/memory-palaces/{name}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_memory_palace(name: str) -> Response:
+def delete_memory_palace(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> Response:
     memory_palace_manager.delete_memory_palace(name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/routine-tasks", response_model=list[RoutineTaskListItem])
-def list_routine_tasks() -> list[RoutineTaskListItem]:
+def list_routine_tasks(
+    _: str = Depends(get_current_subject),
+) -> list[RoutineTaskListItem]:
     return routine_task_manager.list_tasks()
 
 
 @app.post("/api/routine-tasks", response_model=RoutineTaskRecord)
-async def create_routine_task(payload: RoutineTaskCreate) -> RoutineTaskRecord:
+async def create_routine_task(
+    payload: RoutineTaskCreate,
+    _: str = Depends(get_current_subject),
+) -> RoutineTaskRecord:
     return await routine_task_manager.create_task(payload)
 
 
 @app.get("/api/routine-tasks/{name}", response_model=RoutineTaskRecord)
-def get_routine_task(name: str) -> RoutineTaskRecord:
+def get_routine_task(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> RoutineTaskRecord:
     return routine_task_manager.get_task(name)
 
 
@@ -143,23 +163,33 @@ def get_routine_task(name: str) -> RoutineTaskRecord:
 async def update_routine_task(
     name: str,
     payload: RoutineTaskUpdate,
+    _: str = Depends(get_current_subject),
 ) -> RoutineTaskRecord:
     return await routine_task_manager.update_task(name, payload)
 
 
 @app.delete("/api/routine-tasks/{name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_routine_task(name: str) -> Response:
+async def delete_routine_task(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> Response:
     await routine_task_manager.delete_task(name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/api/routine-tasks/{name}/pause", response_model=RoutineTaskRecord)
-async def pause_routine_task(name: str) -> RoutineTaskRecord:
+async def pause_routine_task(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> RoutineTaskRecord:
     return await routine_task_manager.pause_task(name)
 
 
 @app.post("/api/routine-tasks/{name}/resume", response_model=RoutineTaskRecord)
-async def resume_routine_task(name: str) -> RoutineTaskRecord:
+async def resume_routine_task(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> RoutineTaskRecord:
     return await routine_task_manager.resume_task(name)
 
 

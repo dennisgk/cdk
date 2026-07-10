@@ -95,6 +95,17 @@ export async function sendJson<T>(
   return (await response.json()) as T
 }
 
+export async function deleteJson(url: string) {
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers: withAuthHeaders(),
+  })
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => null)) as ApiErrorBody | null
+    throw new Error(formatApiErrorDetail(errorBody?.detail))
+  }
+}
+
 export async function loginWithPassword(password: string) {
   return sendJson<LoginResponse>(`${API_BASE_URL}/auth/login`, {
     method: 'POST',

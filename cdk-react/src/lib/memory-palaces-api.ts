@@ -1,4 +1,4 @@
-import { API_BASE_URL, getJson, sendJson } from '@/lib/api'
+import { API_BASE_URL, deleteJson, getJson, sendJson } from '@/lib/api'
 
 export type MemoryPalaceRecord = {
   name: string
@@ -46,11 +46,6 @@ export function updateMemoryPalace(name: string, payload: MemoryPalaceUpdateInpu
   )
 }
 
-export async function deleteMemoryPalace(name: string) {
-  const response = await fetch(`${API_BASE_URL}/memory-palaces/${encodeURIComponent(name)}`, {
-    method: 'DELETE',
-  })
-  if (!response.ok) {
-    throw new Error('Failed to delete memory palace.')
-  }
+export function deleteMemoryPalace(name: string) {
+  return deleteJson(`${API_BASE_URL}/memory-palaces/${encodeURIComponent(name)}`)
 }

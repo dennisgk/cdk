@@ -1,4 +1,4 @@
-import { API_BASE_URL, formatApiErrorDetail, getJson, sendJson } from '@/lib/api'
+import { API_BASE_URL, deleteJson, formatApiErrorDetail, getJson, sendJson } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 import type { RoutineTaskRemoteOptions } from '@/lib/routine-task-jsx'
 
@@ -68,16 +68,8 @@ export function updateRoutineTask(name: string, payload: RoutineTaskUpdateInput)
   )
 }
 
-export async function deleteRoutineTask(name: string) {
-  const response = await fetch(
-    `${API_BASE_URL}/routine-tasks/${encodeURIComponent(name)}`,
-    {
-      method: 'DELETE',
-    },
-  )
-  if (!response.ok) {
-    throw new Error('Failed to delete routine task.')
-  }
+export function deleteRoutineTask(name: string) {
+  return deleteJson(`${API_BASE_URL}/routine-tasks/${encodeURIComponent(name)}`)
 }
 
 export function pauseRoutineTask(name: string) {
