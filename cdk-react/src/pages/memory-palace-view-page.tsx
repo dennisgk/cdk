@@ -8,8 +8,16 @@ import {
   useFloating,
   useInteractions,
 } from '@floating-ui/react'
-import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber'
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+} from 'react'
 import {
   Box,
   ChevronRight,
@@ -31,14 +39,18 @@ import {
   Torus,
 } from 'lucide-react'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js'
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import {
   Box3,
+  BoxGeometry,
   BufferAttribute,
   BufferGeometry,
   CanvasTexture,
+  ConeGeometry,
+  CylinderGeometry,
   DoubleSide,
   Euler,
   Group,
@@ -57,6 +69,8 @@ import {
   Quaternion,
   Raycaster,
   ShaderMaterial,
+  SphereGeometry,
+  TorusGeometry,
   TOUCH,
   Vector2,
   Vector3,
@@ -64,8 +78,22 @@ import {
 import { useParams } from 'react-router-dom'
 
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { usePageBreadcrumbs } from '@/lib/breadcrumbs'
-import { getMemoryPalace, type MemoryPalaceRecord } from '@/lib/memory-palaces-api'
+import {
+  fetchMemoryPalaceAsset,
+  getMemoryPalace,
+  getMemoryPalaceScene,
+  saveMemoryPalaceScene,
+  uploadMemoryPalaceAsset,
+  type MemoryPalaceRecord,
+} from '@/lib/memory-palaces-api'
 
 const NO_ACTION = -1
 const TOOL_ACTIVATION_DELAY_MS = 120
@@ -152,6 +180,7 @@ type ImportedModelSceneObject = {
   importedModel: {
     format: ImportFormat
     fileName: string
+    assetId: string
     object3d: Group
   }
 }
@@ -275,8 +304,80 @@ const FLOOR_MOUNT_DIRECTION_ROTATIONS: Record<
   down: [Math.PI / 2, 0, 0],
 }
 
+// Yaw for the mount hooks part per mount direction, in 90° steps from the
+// file's as-exported facing (= right/+x). +90° about y turns +x toward -z (up).
+const FLOOR_MOUNT_DIRECTION_Y_ROTATIONS: Record<FloorMountDirection, number> = {
+  right: 0,
+  up: Math.PI / 2,
+  left: Math.PI,
+  down: -Math.PI / 2,
+}
+
 const FLOOR_FLAT_COLOR = '#c6d8cb'
 const FLOOR_MOUNT_COLOR = '#c2b3dd'
+
+// Physical mount system: 25 mm in the real part equals 1 world unit (one cell).
+const MM_PER_UNIT = 25
+const FLOOR_DEFAULT_HEIGHT = 0.2
+const MOUNT_HOOKS_STL_URL = '/assets/plainhooks.stl'
+
+// The file is millimeters, z-up, and positioned far from the origin, so fully
+// normalize it: convert axes and units (25 mm = 1 unit, never rescale beyond
+// that), center it on the cell, and put the bounding-box top at y = 0 so
+// placing the mesh at y = -floorHeight hangs it flush under the floor.
+const transformMountHooksGeometry = (raw: BufferGeometry) => {
+  const next = raw.clone()
+  next.rotateX(Math.PI / 2)
+  // The exported facing is 90° off from the "right" mount direction.
+  next.rotateY(Math.PI / 2)
+  next.scale(1 / MM_PER_UNIT, 1 / MM_PER_UNIT, 1 / MM_PER_UNIT)
+  next.computeBoundingBox()
+  const bounds = next.boundingBox
+  if (bounds) {
+    next.translate(
+      -(bounds.min.x + bounds.max.x) / 2,
+      -bounds.max.y,
+      -(bounds.min.z + bounds.max.z) / 2,
+    )
+  }
+  return next
+}
+
+let mountHooksExportGeometryPromise: Promise<BufferGeometry> | null = null
+
+const getMountHooksGeometryForExport = () => {
+  mountHooksExportGeometryPromise ??= fetch(MOUNT_HOOKS_STL_URL)
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error('Failed to load plainhooks.stl.')
+      }
+      return response.arrayBuffer()
+    })
+    .then((buffer) => transformMountHooksGeometry(new STLLoader().parse(buffer)))
+  return mountHooksExportGeometryPromise
+}
+
+const createDrawnSurfaceGeometryArrays = (
+  drawnSurface: DrawnSurfaceSceneObject['drawnSurface'],
+) => {
+  const positions = new Float32Array(
+    drawnSurface.linePoints.flatMap(([x, y]) => [
+      drawnSurface.depth / 2,
+      y,
+      x,
+      -drawnSurface.depth / 2,
+      y,
+      x,
+    ]),
+  )
+  const indices = new Uint16Array(
+    drawnSurface.linePoints.slice(0, -1).flatMap((_, index) => {
+      const base = index * 2
+      return [base, base + 1, base + 2, base + 1, base + 3, base + 2]
+    }),
+  )
+  return { positions, indices }
+}
 
 const MESH_PRIMITIVES: Array<{
   kind: MeshPrimitiveKind
@@ -323,6 +424,61 @@ const normalizeImportedModel = (model: Object3D) => {
   }
   return container
 }
+
+const parseImportedModel = async (
+  format: ImportFormat,
+  buffer: ArrayBuffer,
+): Promise<Object3D> => {
+  if (format === 'stl') {
+    const geometry = new STLLoader().parse(buffer)
+    if (!geometry.getAttribute('normal')) {
+      geometry.computeVertexNormals()
+    }
+    return new Mesh(
+      geometry,
+      new MeshStandardMaterial({
+        color: '#b8c4cc',
+        roughness: 0.78,
+        metalness: 0.12,
+      }),
+    )
+  }
+  if (format === 'glb') {
+    const gltf = await new GLTFLoader().parseAsync(buffer, '')
+    return gltf.scene
+  }
+  return new FBXLoader().parse(buffer, '')
+}
+
+// The on-disk scene mirrors the runtime types exactly, except imported models
+// persist an assetId instead of the parsed three.js object.
+type PersistedImportedModelSceneObject = Omit<
+  ImportedModelSceneObject,
+  'importedModel'
+> & {
+  importedModel: {
+    format: ImportFormat
+    fileName: string
+    assetId: string
+  }
+}
+type PersistedSceneObject =
+  | Exclude<SceneObject, ImportedModelSceneObject>
+  | PersistedImportedModelSceneObject
+
+const serializeSceneObjects = (objects: SceneObject[]): PersistedSceneObject[] =>
+  objects.map((object) =>
+    object.primitiveType === 'imported-model'
+      ? {
+          ...object,
+          importedModel: {
+            format: object.importedModel.format,
+            fileName: object.importedModel.fileName,
+            assetId: object.importedModel.assetId,
+          },
+        }
+      : object,
+  )
 
 const radiansToDegrees = (value: number) => value * DEGREES_PER_RADIAN
 const degreesToRadians = (value: number) => value / DEGREES_PER_RADIAN
@@ -447,6 +603,7 @@ function CameraControls({
   onToolActiveChange,
   onSelectedSurfaceFacePick,
   cameraOrientationRef,
+  cameraPositionRef,
   cameraTargetRef,
   penProjectionSurfaceId,
   sceneMode,
@@ -464,6 +621,7 @@ function CameraControls({
     face: SelectedSurfaceFace,
   ) => void
   cameraOrientationRef: React.MutableRefObject<Quaternion>
+  cameraPositionRef: React.MutableRefObject<Vector3>
   cameraTargetRef: React.MutableRefObject<Vector3>
   penProjectionSurfaceId: string | null
   sceneMode: SceneMode
@@ -1392,6 +1550,7 @@ function CameraControls({
   useFrame(() => {
     controlsRef.current?.update()
     cameraOrientationRef.current.copy(camera.quaternion)
+    cameraPositionRef.current.copy(camera.position)
     if (controlsRef.current) {
       cameraTargetRef.current.copy(controlsRef.current.target)
     }
@@ -1546,6 +1705,107 @@ function SceneCameraRig({
   )
 }
 
+function FloorMountHooks({
+  positions,
+  mountDirection,
+  floorHeight,
+}: {
+  positions: Array<[number, number]>
+  mountDirection: FloorMountDirection
+  floorHeight: number
+}) {
+  const rawGeometry = useLoader(STLLoader, MOUNT_HOOKS_STL_URL)
+  const geometry = useMemo(() => transformMountHooksGeometry(rawGeometry), [rawGeometry])
+
+  useEffect(() => () => geometry.dispose(), [geometry])
+
+  return (
+    <>
+      {positions.map(([x, z]) => (
+        <mesh
+          key={`${x}:${z}`}
+          geometry={geometry}
+          position={[x, -floorHeight, z]}
+          rotation={[0, FLOOR_MOUNT_DIRECTION_Y_ROTATIONS[mountDirection], 0]}
+        >
+          <meshStandardMaterial color="#9184c9" roughness={0.8} metalness={0.05} />
+        </mesh>
+      ))}
+    </>
+  )
+}
+
+function FloorObjectMeshes({
+  object,
+  selected,
+}: {
+  object: FloorSceneObject
+  selected: boolean
+}) {
+  const mountCellPositions: Array<[number, number]> = []
+  object.floor.cells.forEach((cellRow, rowIndex) => {
+    cellRow.forEach((cell, columnIndex) => {
+      if (cell === 'mount') {
+        mountCellPositions.push(floorCellToWorld(rowIndex, columnIndex))
+      }
+    })
+  })
+
+  return (
+    <group>
+      {object.floor.cells.map((cellRow, rowIndex) =>
+        cellRow.map((cell, columnIndex) => {
+          if (cell === 'empty') {
+            return null
+          }
+          const [cellX, cellZ] = floorCellToWorld(rowIndex, columnIndex)
+          return (
+            <group key={`${rowIndex}-${columnIndex}`}>
+              <mesh
+                position={[cellX, -object.floor.height / 2, cellZ]}
+                receiveShadow
+              >
+                <boxGeometry args={[1, object.floor.height, 1]} />
+                <meshStandardMaterial
+                  color={cell === 'mount' ? FLOOR_MOUNT_COLOR : FLOOR_FLAT_COLOR}
+                  roughness={0.92}
+                  metalness={0.02}
+                />
+              </mesh>
+              <mesh
+                position={[cellX, 0.001, cellZ]}
+                rotation={[-Math.PI / 2, 0, 0]}
+                receiveShadow
+              >
+                <planeGeometry args={[1, 1]} />
+                <FloorGridMaterial selected={selected} mount={cell === 'mount'} />
+              </mesh>
+              {cell === 'mount' ? (
+                <mesh
+                  position={[cellX, 0.12, cellZ]}
+                  rotation={FLOOR_MOUNT_DIRECTION_ROTATIONS[object.floor.mountDirection]}
+                >
+                  <coneGeometry args={[0.1, 0.32, 12]} />
+                  <meshStandardMaterial color="#8656d9" emissive="#2a1747" />
+                </mesh>
+              ) : null}
+            </group>
+          )
+        }),
+      )}
+      {mountCellPositions.length > 0 ? (
+        <Suspense fallback={null}>
+          <FloorMountHooks
+            positions={mountCellPositions}
+            mountDirection={object.floor.mountDirection}
+            floorHeight={object.floor.height}
+          />
+        </Suspense>
+      ) : null}
+    </group>
+  )
+}
+
 function SceneObjects({
   objects,
   selectedIds,
@@ -1614,22 +1874,9 @@ function SceneObjects({
         }
 
         if (object.primitiveType === 'drawn-surface') {
-          const positions = new Float32Array(
-            object.drawnSurface.linePoints.flatMap(([x, y]) => [
-              object.drawnSurface.depth / 2,
-              y,
-              x,
-              -object.drawnSurface.depth / 2,
-              y,
-              x,
-            ]),
+          const { positions, indices } = createDrawnSurfaceGeometryArrays(
+            object.drawnSurface,
           )
-          const indices = object.drawnSurface.linePoints
-            .slice(0, -1)
-            .flatMap((_, index) => {
-              const base = index * 2
-              return [base, base + 1, base + 2, base + 1, base + 3, base + 2]
-            })
           return (
             <group
               key={object.id}
@@ -1645,7 +1892,7 @@ function SceneObjects({
                   />
                   <bufferAttribute
                     attach="index"
-                    args={[new Uint16Array(indices), 1]}
+                    args={[indices, 1]}
                   />
                 </bufferGeometry>
                 <meshStandardMaterial
@@ -1698,51 +1945,11 @@ function SceneObjects({
         }
 
         return (
-          <group key={object.id}>
-            {object.floor.cells.map((cellRow, rowIndex) =>
-              cellRow.map((cell, columnIndex) => {
-                if (cell === 'empty') {
-                  return null
-                }
-                const [cellX, cellZ] = floorCellToWorld(rowIndex, columnIndex)
-                return (
-                  <group key={`${object.id}-${rowIndex}-${columnIndex}`}>
-                    <mesh
-                      position={[cellX, -object.floor.height / 2, cellZ]}
-                      receiveShadow
-                    >
-                      <boxGeometry args={[1, object.floor.height, 1]} />
-                      <meshStandardMaterial
-                        color={cell === 'mount' ? FLOOR_MOUNT_COLOR : FLOOR_FLAT_COLOR}
-                        roughness={0.92}
-                        metalness={0.02}
-                      />
-                    </mesh>
-                    <mesh
-                      position={[cellX, 0.001, cellZ]}
-                      rotation={[-Math.PI / 2, 0, 0]}
-                      receiveShadow
-                    >
-                      <planeGeometry args={[1, 1]} />
-                      <FloorGridMaterial
-                        selected={selectedIds.has(object.id)}
-                        mount={cell === 'mount'}
-                      />
-                    </mesh>
-                    {cell === 'mount' ? (
-                      <mesh
-                        position={[cellX, 0.12, cellZ]}
-                        rotation={FLOOR_MOUNT_DIRECTION_ROTATIONS[object.floor.mountDirection]}
-                      >
-                        <coneGeometry args={[0.1, 0.32, 12]} />
-                        <meshStandardMaterial color="#8656d9" emissive="#2a1747" />
-                      </mesh>
-                    ) : null}
-                  </group>
-                )
-              }),
-            )}
-          </group>
+          <FloorObjectMeshes
+            key={object.id}
+            object={object}
+            selected={selectedIds.has(object.id)}
+          />
         )
       })}
       {objects
@@ -1855,6 +2062,260 @@ function SelectedSurfaceDraftOverlay({
   )
 }
 
+type PenStrokeMeshData = {
+  positions: Float32Array
+  indices: Uint16Array
+  normals: Float32Array
+}
+
+const createPenStrokeMeshData = (
+  points: [number, number, number][],
+  options: {
+    strokeWidth: number
+    strokeDepth: number
+    cylindricalDivisions: number
+    surfaceNormal: [number, number, number]
+    parentScale: [number, number, number]
+  },
+): PenStrokeMeshData | null => {
+  if (points.length < 2) {
+    return null
+  }
+
+  const parentScaleVector = new Vector3(
+    Math.max(Math.abs(options.parentScale[0]), 1e-6),
+    Math.max(Math.abs(options.parentScale[1]), 1e-6),
+    Math.max(Math.abs(options.parentScale[2]), 1e-6),
+  )
+  const localNormalVector = new Vector3(
+    options.surfaceNormal[0],
+    options.surfaceNormal[1],
+    options.surfaceNormal[2],
+  ).normalize()
+  const computeAxisScale = (axis: Vector3) =>
+    new Vector3(
+      axis.x * parentScaleVector.x,
+      axis.y * parentScaleVector.y,
+      axis.z * parentScaleVector.z,
+    ).length()
+
+  const divisions = Math.max(3, Math.round(options.cylindricalDivisions))
+  const halfWidth = options.strokeWidth / 2
+  const halfDepth = options.strokeDepth / 2
+  const positions: number[] = []
+  const indices: number[] = []
+  const capSteps = Math.max(2, Math.min(6, Math.round(divisions / 3)))
+  const tangents = points.map((point, index) => {
+    const current = new Vector3(...point)
+    const previous =
+      index > 0 ? new Vector3(...points[index - 1]) : new Vector3(...points[index])
+    const next =
+      index < points.length - 1
+        ? new Vector3(...points[index + 1])
+        : new Vector3(...points[index])
+
+    const tangent =
+      index === 0
+        ? next.clone().sub(current)
+        : index === points.length - 1
+          ? current.clone().sub(previous)
+          : next.clone().sub(previous)
+
+    return tangent.normalize()
+  })
+
+  const depthAxes = tangents.map((tangent) => {
+    const depthAxis = localNormalVector
+      .clone()
+      .sub(tangent.clone().multiplyScalar(localNormalVector.dot(tangent)))
+      .normalize()
+    return depthAxis
+  })
+
+  const widthAxes = tangents.map((tangent, index) => {
+    const widthAxis = new Vector3().crossVectors(depthAxes[index], tangent).normalize()
+    return widthAxis
+  })
+
+  type RingSpec = {
+    center: Vector3
+    widthAxis: Vector3
+    depthAxis: Vector3
+    widthRadius: number
+    depthRadius: number
+  }
+
+  const rings: RingSpec[] = []
+
+  for (let pointIndex = 0; pointIndex < points.length; pointIndex += 1) {
+    const center = new Vector3(...points[pointIndex])
+    const tangent = tangents[pointIndex]
+    const depthAxis = depthAxes[pointIndex]
+    const widthAxis = widthAxes[pointIndex]
+
+    if (
+      tangent.lengthSq() < 1e-6 ||
+      depthAxis.lengthSq() < 1e-6 ||
+      widthAxis.lengthSq() < 1e-6
+    ) {
+      continue
+    }
+
+    const localWidthRadius = halfWidth / Math.max(computeAxisScale(widthAxis), 1e-6)
+    const localDepthRadius = halfDepth / Math.max(computeAxisScale(depthAxis), 1e-6)
+    rings.push({
+      center,
+      widthAxis,
+      depthAxis,
+      widthRadius: localWidthRadius,
+      depthRadius: localDepthRadius,
+    })
+  }
+
+  if (rings.length < 2) {
+    return null
+  }
+
+  const expandedRings: RingSpec[] = []
+  const startTangent = tangents[0]
+  const endTangent = tangents[tangents.length - 1]
+
+  for (let step = capSteps - 1; step >= 1; step -= 1) {
+    const t = step / capSteps
+    const angle = t * (Math.PI / 2)
+    const radiusScale = Math.cos(angle)
+    const extensionScale = Math.sin(angle)
+    const base = rings[0]
+    expandedRings.push({
+      center: base.center
+        .clone()
+        .add(startTangent.clone().multiplyScalar(-halfWidth * extensionScale)),
+      widthAxis: base.widthAxis,
+      depthAxis: base.depthAxis,
+      widthRadius: base.widthRadius * radiusScale,
+      depthRadius: base.depthRadius * radiusScale,
+    })
+  }
+
+  expandedRings.push(...rings)
+
+  for (let step = 1; step < capSteps; step += 1) {
+    const t = step / capSteps
+    const angle = t * (Math.PI / 2)
+    const radiusScale = Math.cos(angle)
+    const extensionScale = Math.sin(angle)
+    const base = rings[rings.length - 1]
+    expandedRings.push({
+      center: base.center
+        .clone()
+        .add(endTangent.clone().multiplyScalar(halfWidth * extensionScale)),
+      widthAxis: base.widthAxis,
+      depthAxis: base.depthAxis,
+      widthRadius: base.widthRadius * radiusScale,
+      depthRadius: base.depthRadius * radiusScale,
+    })
+  }
+
+  for (const ring of expandedRings) {
+    for (let division = 0; division < divisions; division += 1) {
+      const angle = (division / divisions) * Math.PI * 2
+      const radialOffset = ring.widthAxis
+        .clone()
+        .multiplyScalar(Math.cos(angle) * ring.widthRadius)
+        .add(ring.depthAxis.clone().multiplyScalar(Math.sin(angle) * ring.depthRadius))
+      const vertex = ring.center.clone().add(radialOffset)
+      positions.push(vertex.x, vertex.y, vertex.z)
+    }
+  }
+
+  const startPoleIndex = positions.length / 3
+  const startPole = rings[0].center.clone().add(startTangent.clone().multiplyScalar(-halfWidth))
+  positions.push(startPole.x, startPole.y, startPole.z)
+
+  const endPoleIndex = positions.length / 3
+  const endPole = rings[rings.length - 1].center
+    .clone()
+    .add(endTangent.clone().multiplyScalar(halfWidth))
+  positions.push(endPole.x, endPole.y, endPole.z)
+
+  for (let ringIndex = 0; ringIndex < expandedRings.length - 1; ringIndex += 1) {
+    for (let division = 0; division < divisions; division += 1) {
+      const nextDivision = (division + 1) % divisions
+      const startA = ringIndex * divisions + division
+      const startB = ringIndex * divisions + nextDivision
+      const endA = (ringIndex + 1) * divisions + division
+      const endB = (ringIndex + 1) * divisions + nextDivision
+      indices.push(startA, endA, startB)
+      indices.push(startB, endA, endB)
+    }
+  }
+
+  for (let division = 0; division < divisions; division += 1) {
+    const nextDivision = (division + 1) % divisions
+    indices.push(startPoleIndex, division, nextDivision)
+  }
+
+  const lastRingStart = (expandedRings.length - 1) * divisions
+  for (let division = 0; division < divisions; division += 1) {
+    const nextDivision = (division + 1) % divisions
+    indices.push(
+      endPoleIndex,
+      lastRingStart + nextDivision,
+      lastRingStart + division,
+    )
+  }
+
+  const positionsArray = new Float32Array(positions)
+  const indicesArray = new Uint16Array(indices)
+  const geometry = new BufferGeometry()
+  geometry.setAttribute('position', new BufferAttribute(positionsArray, 3))
+  geometry.setIndex(new BufferAttribute(indicesArray, 1))
+  geometry.computeVertexNormals()
+  const normalAttribute = geometry.getAttribute('normal')
+  const normalsArray = new Float32Array(normalAttribute.array)
+  geometry.dispose()
+
+  return {
+    positions: positionsArray,
+    indices: indicesArray,
+    normals: normalsArray,
+  }
+}
+
+const computePenWorldStrokes = (
+  penObject: PenSceneObject,
+  parentObject: DrawnSurfaceSceneObject | SelectedSurfaceSceneObject,
+) => {
+  const parentQuaternion = new Quaternion().setFromEuler(
+    new Euler(
+      parentObject.rotation[0],
+      parentObject.rotation[1],
+      parentObject.rotation[2],
+      'XYZ',
+    ),
+  )
+  const parentMatrix = new Matrix4().compose(
+    new Vector3(...parentObject.position),
+    parentQuaternion,
+    new Vector3(...parentObject.scale),
+  )
+  const normalMatrix = new Matrix3().getNormalMatrix(parentMatrix)
+  const worldNormalVector = new Vector3(0, 0, 1).applyNormalMatrix(normalMatrix).normalize()
+  return {
+    worldNormal: [
+      worldNormalVector.x,
+      worldNormalVector.y,
+      worldNormalVector.z,
+    ] as [number, number, number],
+    worldStrokes: penObject.pen.strokes.map((stroke) =>
+      stroke.map((point) => {
+        const worldPoint = new Vector3(point[0], point[1], point[2]).applyMatrix4(parentMatrix)
+        return [worldPoint.x, worldPoint.y, worldPoint.z] as [number, number, number]
+      }),
+    ),
+  }
+}
+
 function PenStrokeMeshes({
   strokes,
   strokeWidth,
@@ -1872,239 +2333,35 @@ function PenStrokeMeshes({
   parentScale?: [number, number, number]
   surfaceNormal?: [number, number, number]
 }) {
-  const parentScaleVector = new Vector3(
-    Math.max(Math.abs(parentScale[0]), 1e-6),
-    Math.max(Math.abs(parentScale[1]), 1e-6),
-    Math.max(Math.abs(parentScale[2]), 1e-6),
+  type StrokeMeshEntry = PenStrokeMeshData & { key: string }
+
+  const strokeMeshes = useMemo<StrokeMeshEntry[]>(
+    () =>
+      strokes
+        .map((stroke, strokeIndex) => {
+          const data = createPenStrokeMeshData(stroke, {
+            strokeWidth,
+            strokeDepth,
+            cylindricalDivisions,
+            surfaceNormal,
+            parentScale,
+          })
+          return data ? { key: `stroke-${strokeIndex}`, ...data } : null
+        })
+        .filter((value): value is StrokeMeshEntry => value !== null),
+    [
+      cylindricalDivisions,
+      strokeDepth,
+      strokeWidth,
+      strokes,
+      surfaceNormal[0],
+      surfaceNormal[1],
+      surfaceNormal[2],
+      parentScale[0],
+      parentScale[1],
+      parentScale[2],
+    ],
   )
-  const localNormalVector = new Vector3(
-    surfaceNormal[0],
-    surfaceNormal[1],
-    surfaceNormal[2],
-  ).normalize()
-  const computeAxisScale = (axis: Vector3) =>
-    new Vector3(
-      axis.x * parentScaleVector.x,
-      axis.y * parentScaleVector.y,
-      axis.z * parentScaleVector.z,
-    ).length()
-  type StrokeMeshData = {
-    key: string
-    positions: Float32Array
-    indices: Uint16Array
-    normals: Float32Array
-  }
-
-  const strokeMeshes = useMemo<StrokeMeshData[]>(() => {
-    return strokes
-      .map<StrokeMeshData | null>((stroke, strokeIndex) => {
-        const points = stroke
-        if (points.length < 2) {
-          return null
-        }
-
-        const divisions = Math.max(3, Math.round(cylindricalDivisions))
-        const halfWidth = strokeWidth / 2
-        const halfDepth = strokeDepth / 2
-        const positions: number[] = []
-        const indices: number[] = []
-        const capSteps = Math.max(2, Math.min(6, Math.round(divisions / 3)))
-        const tangents = points.map((point, index) => {
-          const current = new Vector3(...point)
-          const previous =
-            index > 0 ? new Vector3(...points[index - 1]) : new Vector3(...points[index])
-          const next =
-            index < points.length - 1
-              ? new Vector3(...points[index + 1])
-              : new Vector3(...points[index])
-
-          const tangent =
-            index === 0
-              ? next.clone().sub(current)
-              : index === points.length - 1
-                ? current.clone().sub(previous)
-                : next.clone().sub(previous)
-
-          return tangent.normalize()
-        })
-
-        const depthAxes = tangents.map((tangent) => {
-          const depthAxis = localNormalVector
-            .clone()
-            .sub(tangent.clone().multiplyScalar(localNormalVector.dot(tangent)))
-            .normalize()
-          return depthAxis
-        })
-
-        const widthAxes = tangents.map((tangent, index) => {
-          const widthAxis = new Vector3().crossVectors(depthAxes[index], tangent).normalize()
-          return widthAxis
-        })
-
-        const rings: Array<{
-          center: Vector3
-          widthAxis: Vector3
-          depthAxis: Vector3
-          widthRadius: number
-          depthRadius: number
-        }> = []
-
-        for (let pointIndex = 0; pointIndex < points.length; pointIndex += 1) {
-          const center = new Vector3(...points[pointIndex])
-          const tangent = tangents[pointIndex]
-          const depthAxis = depthAxes[pointIndex]
-          const widthAxis = widthAxes[pointIndex]
-
-          if (
-            tangent.lengthSq() < 1e-6 ||
-            depthAxis.lengthSq() < 1e-6 ||
-            widthAxis.lengthSq() < 1e-6
-          ) {
-            continue
-          }
-
-          const localWidthRadius = halfWidth / Math.max(computeAxisScale(widthAxis), 1e-6)
-          const localDepthRadius = halfDepth / Math.max(computeAxisScale(depthAxis), 1e-6)
-          rings.push({
-            center,
-            widthAxis,
-            depthAxis,
-            widthRadius: localWidthRadius,
-            depthRadius: localDepthRadius,
-          })
-        }
-
-        if (rings.length < 2) {
-          return null
-        }
-
-        type RingSpec = {
-          center: Vector3
-          widthAxis: Vector3
-          depthAxis: Vector3
-          widthRadius: number
-          depthRadius: number
-        }
-
-        const expandedRings: RingSpec[] = []
-        const startTangent = tangents[0]
-        const endTangent = tangents[tangents.length - 1]
-
-        for (let step = capSteps - 1; step >= 1; step -= 1) {
-          const t = step / capSteps
-          const angle = t * (Math.PI / 2)
-          const radiusScale = Math.cos(angle)
-          const extensionScale = Math.sin(angle)
-          const base = rings[0]
-          expandedRings.push({
-            center: base.center
-              .clone()
-              .add(startTangent.clone().multiplyScalar(-halfWidth * extensionScale)),
-            widthAxis: base.widthAxis,
-            depthAxis: base.depthAxis,
-            widthRadius: base.widthRadius * radiusScale,
-            depthRadius: base.depthRadius * radiusScale,
-          })
-        }
-
-        expandedRings.push(...rings)
-
-        for (let step = 1; step < capSteps; step += 1) {
-          const t = step / capSteps
-          const angle = t * (Math.PI / 2)
-          const radiusScale = Math.cos(angle)
-          const extensionScale = Math.sin(angle)
-          const base = rings[rings.length - 1]
-          expandedRings.push({
-            center: base.center
-              .clone()
-              .add(endTangent.clone().multiplyScalar(halfWidth * extensionScale)),
-            widthAxis: base.widthAxis,
-            depthAxis: base.depthAxis,
-            widthRadius: base.widthRadius * radiusScale,
-            depthRadius: base.depthRadius * radiusScale,
-          })
-        }
-
-        for (const ring of expandedRings) {
-          for (let division = 0; division < divisions; division += 1) {
-            const angle = (division / divisions) * Math.PI * 2
-            const radialOffset = ring.widthAxis
-              .clone()
-              .multiplyScalar(Math.cos(angle) * ring.widthRadius)
-              .add(ring.depthAxis.clone().multiplyScalar(Math.sin(angle) * ring.depthRadius))
-            const vertex = ring.center.clone().add(radialOffset)
-            positions.push(vertex.x, vertex.y, vertex.z)
-          }
-        }
-
-        const startPoleIndex = positions.length / 3
-        const startPole = rings[0].center.clone().add(startTangent.clone().multiplyScalar(-halfWidth))
-        positions.push(startPole.x, startPole.y, startPole.z)
-
-        const endPoleIndex = positions.length / 3
-        const endPole = rings[rings.length - 1].center
-          .clone()
-          .add(endTangent.clone().multiplyScalar(halfWidth))
-        positions.push(endPole.x, endPole.y, endPole.z)
-
-        for (let ringIndex = 0; ringIndex < expandedRings.length - 1; ringIndex += 1) {
-          for (let division = 0; division < divisions; division += 1) {
-            const nextDivision = (division + 1) % divisions
-            const startA = ringIndex * divisions + division
-            const startB = ringIndex * divisions + nextDivision
-            const endA = (ringIndex + 1) * divisions + division
-            const endB = (ringIndex + 1) * divisions + nextDivision
-            indices.push(startA, endA, startB)
-            indices.push(startB, endA, endB)
-          }
-        }
-
-        for (let division = 0; division < divisions; division += 1) {
-          const nextDivision = (division + 1) % divisions
-          indices.push(startPoleIndex, division, nextDivision)
-        }
-
-        const lastRingStart = (expandedRings.length - 1) * divisions
-        for (let division = 0; division < divisions; division += 1) {
-          const nextDivision = (division + 1) % divisions
-          indices.push(
-            endPoleIndex,
-            lastRingStart + nextDivision,
-            lastRingStart + division,
-          )
-        }
-
-        const positionsArray = new Float32Array(positions)
-        const indicesArray = new Uint16Array(indices)
-        const geometry = new BufferGeometry()
-        geometry.setAttribute('position', new BufferAttribute(positionsArray, 3))
-        geometry.setIndex(new BufferAttribute(indicesArray, 1))
-        geometry.computeVertexNormals()
-        const normalAttribute = geometry.getAttribute('normal')
-        const normalsArray = new Float32Array(normalAttribute.array)
-        geometry.dispose()
-
-        return {
-          key: `stroke-${strokeIndex}`,
-          positions: positionsArray,
-          indices: indicesArray,
-          normals: normalsArray,
-        }
-      })
-      .filter((value): value is StrokeMeshData => value !== null)
-  }, [
-    cylindricalDivisions,
-    localNormalVector.x,
-    localNormalVector.y,
-    localNormalVector.z,
-    parentScaleVector.x,
-    parentScaleVector.y,
-    parentScaleVector.z,
-    strokeDepth,
-    strokeWidth,
-    strokes,
-  ])
 
   return (
     <>
@@ -2145,38 +2402,10 @@ function PenObjectMeshes({
   parentObject: DrawnSurfaceSceneObject | SelectedSurfaceSceneObject
   selected: boolean
 }) {
-  const { worldNormal, worldStrokes } = useMemo(() => {
-    const parentQuaternion = new Quaternion().setFromEuler(
-      new Euler(
-        parentObject.rotation[0],
-        parentObject.rotation[1],
-        parentObject.rotation[2],
-        'XYZ',
-      ),
-    )
-    const parentMatrix = new Matrix4().compose(
-      new Vector3(...parentObject.position),
-      parentQuaternion,
-      new Vector3(...parentObject.scale),
-    )
-    const normalMatrix = new Matrix3().getNormalMatrix(parentMatrix)
-    const worldNormal = new Vector3(0, 0, 1).applyNormalMatrix(normalMatrix).normalize()
-    const worldStrokes = penObject.pen.strokes.map((stroke) =>
-      stroke.map((point) => {
-        const worldPoint = new Vector3(point[0], point[1], point[2]).applyMatrix4(parentMatrix)
-        return [worldPoint.x, worldPoint.y, worldPoint.z] as [number, number, number]
-      }),
-    )
-    return {
-      worldNormal: [worldNormal.x, worldNormal.y, worldNormal.z] as [number, number, number],
-      worldStrokes,
-    }
-  }, [
-    parentObject.position,
-    parentObject.rotation,
-    parentObject.scale,
-    penObject.pen.strokes,
-  ])
+  const { worldNormal, worldStrokes } = useMemo(
+    () => computePenWorldStrokes(penObject, parentObject),
+    [parentObject, penObject],
+  )
 
   return (
     <PenStrokeMeshes
@@ -2671,7 +2900,23 @@ export function MemoryPalaceViewPage() {
     'general',
   )
   const cameraOrientationRef = useRef(new Quaternion())
+  const cameraPositionRef = useRef(new Vector3(3, 3, 3))
   const cameraTargetRef = useRef(new Vector3(0, 0, 0))
+  const initialCameraPositionRef = useRef<[number, number, number]>([3, 3, 3])
+  const [sceneStatus, setSceneStatus] = useState<'loading' | 'ready' | 'error'>(
+    'loading',
+  )
+  const [sceneError, setSceneError] = useState<string | null>(null)
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>(
+    'idle',
+  )
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
+  const [exportFormat, setExportFormat] = useState<'stl'>('stl')
+  const [exportIncludeFloor, setExportIncludeFloor] = useState(true)
+  const [exportIncludeDrawnSurfaces, setExportIncludeDrawnSurfaces] = useState(false)
+  const [exportIncludeSelectedSurfaces, setExportIncludeSelectedSurfaces] =
+    useState(false)
+  const [exportBusy, setExportBusy] = useState(false)
   const [cameraAlignRequest, setCameraAlignRequest] = useState<{
     axis: CameraAlignAxis
     nonce: number
@@ -3076,6 +3321,296 @@ export function MemoryPalaceViewPage() {
     }
   }, [decodedName])
 
+  useEffect(() => {
+    let isActive = true
+    setSceneStatus('loading')
+    setSceneError(null)
+
+    const loadScene = async () => {
+      const sceneFile = await getMemoryPalaceScene(decodedName)
+      const persisted = (sceneFile.scene?.objects ?? []) as PersistedSceneObject[]
+      const loaded: SceneObject[] = []
+      for (const object of persisted) {
+        if (object.primitiveType === 'imported-model') {
+          const buffer = await fetchMemoryPalaceAsset(
+            decodedName,
+            object.importedModel.assetId,
+          )
+          const model = await parseImportedModel(object.importedModel.format, buffer)
+          loaded.push({
+            ...object,
+            importedModel: {
+              ...object.importedModel,
+              object3d: normalizeImportedModel(model),
+            },
+          })
+        } else {
+          loaded.push(object)
+        }
+      }
+      if (!isActive) {
+        return
+      }
+      if (sceneFile.editor) {
+        initialCameraPositionRef.current = sceneFile.editor.cameraPosition
+        cameraPositionRef.current.set(...sceneFile.editor.cameraPosition)
+        cameraTargetRef.current.set(...sceneFile.editor.cameraTarget)
+        setCameraMode(sceneFile.editor.cameraMode)
+      }
+      setObjects(loaded)
+      setSceneStatus('ready')
+    }
+
+    loadScene().catch((loadError) => {
+      if (isActive) {
+        setSceneError(
+          loadError instanceof Error ? loadError.message : 'Scene load failed.',
+        )
+        setSceneStatus('error')
+      }
+    })
+    return () => {
+      isActive = false
+    }
+  }, [decodedName])
+
+  useEffect(() => {
+    if (saveStatus !== 'saved') {
+      return
+    }
+    const timer = window.setTimeout(() => setSaveStatus('idle'), 2000)
+    return () => window.clearTimeout(timer)
+  }, [saveStatus])
+
+  const handleSaveScene = async () => {
+    if (saveStatus === 'saving') {
+      return
+    }
+    setSaveStatus('saving')
+    try {
+      await saveMemoryPalaceScene(decodedName, {
+        schemaVersion: 1,
+        savedAt: null,
+        editor: {
+          cameraMode,
+          cameraPosition: [
+            cameraPositionRef.current.x,
+            cameraPositionRef.current.y,
+            cameraPositionRef.current.z,
+          ],
+          cameraTarget: [
+            cameraTargetRef.current.x,
+            cameraTargetRef.current.y,
+            cameraTargetRef.current.z,
+          ],
+        },
+        scene: { objects: serializeSceneObjects(objects) },
+      })
+      setSaveStatus('saved')
+    } catch (saveError) {
+      setSaveStatus('error')
+      appendDebugLog(
+        `[save] failed: ${saveError instanceof Error ? saveError.message : 'unknown error'}`,
+      )
+    }
+  }
+
+  const handleExportScene = async () => {
+    if (exportBusy) {
+      return
+    }
+    setExportBusy(true)
+    const disposables: BufferGeometry[] = []
+    try {
+      const exportGroup = new Group()
+      const objectById = new Map(objects.map((object) => [object.id, object] as const))
+
+      // Primitives, imported models, and pen strokes always export; the
+      // checkboxes only gate floors and the two surface kinds.
+      for (const object of objects) {
+        if (object.objectType === 'Mesh') {
+          const geometry =
+            object.primitiveType === 'cube'
+              ? new BoxGeometry(1, 1, 1)
+              : object.primitiveType === 'sphere'
+                ? new SphereGeometry(0.5, 32, 16)
+                : object.primitiveType === 'cylinder'
+                  ? new CylinderGeometry(0.5, 0.5, 1, 32)
+                  : object.primitiveType === 'cone'
+                    ? new ConeGeometry(0.5, 1, 32)
+                    : new TorusGeometry(0.35, 0.15, 16, 48)
+          disposables.push(geometry)
+          const wrapper = new Group()
+          wrapper.position.set(...object.position)
+          wrapper.rotation.set(...object.rotation)
+          wrapper.scale.set(...object.scale)
+          const mesh = new Mesh(geometry)
+          if (object.primitiveType === 'torus') {
+            mesh.position.set(0, 0.15, 0)
+            mesh.rotation.set(-Math.PI / 2, 0, 0)
+          } else {
+            mesh.position.set(0, 0.5, 0)
+          }
+          wrapper.add(mesh)
+          exportGroup.add(wrapper)
+          continue
+        }
+
+        if (object.primitiveType === 'imported-model') {
+          const wrapper = new Group()
+          wrapper.position.set(...object.position)
+          wrapper.rotation.set(...object.rotation)
+          wrapper.scale.set(...object.scale)
+          wrapper.add(object.importedModel.object3d.clone(true))
+          exportGroup.add(wrapper)
+          continue
+        }
+
+        if (object.primitiveType === 'pen') {
+          const parentObject = objectById.get(object.parentId)
+          if (!parentObject || !isProjectionSurfaceObject(parentObject)) {
+            continue
+          }
+          const { worldNormal, worldStrokes } = computePenWorldStrokes(
+            object,
+            parentObject,
+          )
+          for (const stroke of worldStrokes) {
+            const data = createPenStrokeMeshData(stroke, {
+              strokeWidth: object.pen.strokeWidth,
+              strokeDepth: object.pen.strokeDepth,
+              cylindricalDivisions: object.pen.cylindricalDivisions,
+              surfaceNormal: worldNormal,
+              parentScale: [1, 1, 1],
+            })
+            if (!data) {
+              continue
+            }
+            const geometry = new BufferGeometry()
+            geometry.setAttribute('position', new BufferAttribute(data.positions, 3))
+            geometry.setAttribute('normal', new BufferAttribute(data.normals, 3))
+            geometry.setIndex(new BufferAttribute(data.indices, 1))
+            disposables.push(geometry)
+            exportGroup.add(new Mesh(geometry))
+          }
+        }
+      }
+
+      if (exportIncludeFloor) {
+        const floorObjects = objects.filter(
+          (object): object is FloorSceneObject => object.primitiveType === 'floor',
+        )
+        const needsMountHooks = floorObjects.some((floorObject) =>
+          floorObject.floor.cells.some((cellRow) => cellRow.includes('mount')),
+        )
+        const mountHooksGeometry = needsMountHooks
+          ? await getMountHooksGeometryForExport()
+          : null
+
+        for (const floorObject of floorObjects) {
+          const height = floorObject.floor.height
+          const cellGeometry = new BoxGeometry(1, height, 1)
+          disposables.push(cellGeometry)
+          const yaw = FLOOR_MOUNT_DIRECTION_Y_ROTATIONS[floorObject.floor.mountDirection]
+
+          floorObject.floor.cells.forEach((cellRow, rowIndex) => {
+            cellRow.forEach((cell, columnIndex) => {
+              if (cell === 'empty') {
+                return
+              }
+              const [cellX, cellZ] = floorCellToWorld(rowIndex, columnIndex)
+              const cellMesh = new Mesh(cellGeometry)
+              cellMesh.position.set(cellX, -height / 2, cellZ)
+              exportGroup.add(cellMesh)
+              if (cell === 'mount' && mountHooksGeometry) {
+                const hooksMesh = new Mesh(mountHooksGeometry)
+                hooksMesh.position.set(cellX, -height, cellZ)
+                hooksMesh.rotation.set(0, yaw, 0)
+                exportGroup.add(hooksMesh)
+              }
+            })
+          })
+        }
+      }
+
+      if (exportIncludeDrawnSurfaces) {
+        for (const object of objects) {
+          if (object.primitiveType !== 'drawn-surface') {
+            continue
+          }
+          const { positions, indices } = createDrawnSurfaceGeometryArrays(
+            object.drawnSurface,
+          )
+          const geometry = new BufferGeometry()
+          geometry.setAttribute('position', new BufferAttribute(positions, 3))
+          geometry.setIndex(new BufferAttribute(indices, 1))
+          geometry.computeVertexNormals()
+          disposables.push(geometry)
+          const mesh = new Mesh(geometry)
+          mesh.position.set(...object.position)
+          mesh.rotation.set(...object.rotation)
+          mesh.scale.set(...object.scale)
+          exportGroup.add(mesh)
+        }
+      }
+
+      if (exportIncludeSelectedSurfaces) {
+        for (const object of objects) {
+          if (object.primitiveType !== 'selected-surface') {
+            continue
+          }
+          const geometry = new BufferGeometry()
+          geometry.setAttribute(
+            'position',
+            new BufferAttribute(
+              new Float32Array(object.selectedSurface.vertices.flat()),
+              3,
+            ),
+          )
+          geometry.setIndex(
+            new BufferAttribute(new Uint16Array(object.selectedSurface.indices), 1),
+          )
+          geometry.computeVertexNormals()
+          disposables.push(geometry)
+          const mesh = new Mesh(geometry)
+          mesh.position.set(...object.position)
+          mesh.rotation.set(...object.rotation)
+          mesh.scale.set(...object.scale)
+          exportGroup.add(mesh)
+        }
+      }
+
+      if (exportGroup.children.length === 0) {
+        appendDebugLog('[export] nothing matched the selected options')
+        return
+      }
+
+      // STL consumers read coordinates as millimeters: scale world units back
+      // to the physical 25 mm per cell, returning the hooks part to true size.
+      exportGroup.scale.setScalar(MM_PER_UNIT)
+      exportGroup.updateMatrixWorld(true)
+      const exported = new STLExporter().parse(exportGroup, { binary: true })
+      const blob = new Blob([exported], { type: 'model/stl' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${decodedName}.${exportFormat}`
+      anchor.click()
+      URL.revokeObjectURL(url)
+      setExportDialogOpen(false)
+      appendDebugLog(`[export] ${anchor.download} (${exportGroup.children.length} meshes)`)
+    } catch (exportError) {
+      appendDebugLog(
+        `[export] failed: ${exportError instanceof Error ? exportError.message : 'unknown error'}`,
+      )
+    } finally {
+      for (const geometry of disposables) {
+        geometry.dispose()
+      }
+      setExportBusy(false)
+    }
+  }
+
   const addPrimitive = (kind: MeshPrimitiveKind) => {
     const nextNumber =
       objects.filter(
@@ -3112,7 +3647,12 @@ export function MemoryPalaceViewPage() {
     setAddMenuOpen(false)
   }
 
-  const finishImport = (format: ImportFormat, fileName: string, model: Object3D) => {
+  const finishImport = (
+    format: ImportFormat,
+    fileName: string,
+    assetId: string,
+    model: Object3D,
+  ) => {
     const details = IMPORT_FORMAT_DETAILS[format]
     const container = normalizeImportedModel(model)
     const nextNumber =
@@ -3133,6 +3673,7 @@ export function MemoryPalaceViewPage() {
       importedModel: {
         format,
         fileName,
+        assetId,
         object3d: container,
       },
     }
@@ -3154,30 +3695,10 @@ export function MemoryPalaceViewPage() {
       return
     }
     try {
+      const asset = await uploadMemoryPalaceAsset(decodedName, file)
       const buffer = await file.arrayBuffer()
-      if (format === 'stl') {
-        const geometry = new STLLoader().parse(buffer)
-        if (!geometry.getAttribute('normal')) {
-          geometry.computeVertexNormals()
-        }
-        finishImport(
-          format,
-          file.name,
-          new Mesh(
-            geometry,
-            new MeshStandardMaterial({
-              color: '#b8c4cc',
-              roughness: 0.78,
-              metalness: 0.12,
-            }),
-          ),
-        )
-      } else if (format === 'glb') {
-        const gltf = await new GLTFLoader().parseAsync(buffer, '')
-        finishImport(format, file.name, gltf.scene)
-      } else {
-        finishImport(format, file.name, new FBXLoader().parse(buffer, ''))
-      }
+      const model = await parseImportedModel(format, buffer)
+      finishImport(format, file.name, asset.asset_id, model)
     } catch (importError) {
       appendDebugLog(
         `[import] ${format} import of ${file.name} failed: ${
@@ -3198,7 +3719,7 @@ export function MemoryPalaceViewPage() {
       primitiveType: 'floor',
       name: 'Floor',
       floor: {
-        height: 0.2,
+        height: FLOOR_DEFAULT_HEIGHT,
         cells: createDefaultFloorCells(),
         mountDirection: 'right',
       },
@@ -3596,12 +4117,9 @@ export function MemoryPalaceViewPage() {
     })
   }
 
-  const updateSelectedFloorHeight = (value: string) => {
-    if (!selectedObject || selectedObject.primitiveType !== 'floor') {
-      return
-    }
+  const updateFloorHeightById = (objectId: string, value: string) => {
     const parsedValue = Number(value)
-    updateObject(selectedObject.id, (object) => {
+    updateObject(objectId, (object) => {
       if (object.primitiveType !== 'floor') {
         return object
       }
@@ -3609,10 +4127,19 @@ export function MemoryPalaceViewPage() {
         ...object,
         floor: {
           ...object.floor,
-          height: Number.isFinite(parsedValue) ? Math.max(0.05, parsedValue) : 0.2,
+          height: Number.isFinite(parsedValue)
+            ? Math.max(0.05, parsedValue)
+            : FLOOR_DEFAULT_HEIGHT,
         },
       }
     })
+  }
+
+  const updateSelectedFloorHeight = (value: string) => {
+    if (!selectedObject || selectedObject.primitiveType !== 'floor') {
+      return
+    }
+    updateFloorHeightById(selectedObject.id, value)
   }
 
   const updateSelectedPenValue = (
@@ -3946,12 +4473,15 @@ export function MemoryPalaceViewPage() {
     }
   }, [sceneMode, selectedTool])
 
-  if (error) {
-    return <div className="p-2 text-sm text-destructive">{error}</div>
+  if (error || sceneStatus === 'error') {
+    return (
+      <div className="p-2 text-sm text-destructive">{error ?? sceneError}</div>
+    )
   }
 
-  if (!item) {
-    return <div className="p-2 text-sm text-muted-foreground">Loading...</div>
+  // Nothing is interactable until the scene (including imported assets) is in.
+  if (!item || sceneStatus !== 'ready') {
+    return <div className="p-2 text-sm text-muted-foreground">Loading scene...</div>
   }
 
   return (
@@ -3964,7 +4494,7 @@ export function MemoryPalaceViewPage() {
       />
       <div className="pointer-events-none absolute top-2 right-2 z-10">
         <div className="mb-2 flex justify-end">
-          <div className="flex h-24 w-24 items-center justify-center border border-border bg-background/85 backdrop-blur">
+          <div className="pointer-events-auto flex h-24 w-24 items-center justify-center border border-border bg-background/85 backdrop-blur">
             <Canvas camera={{ position: [0, 0, 4], fov: 45 }}>
               <OrientationCube
                 cameraOrientationRef={cameraOrientationRef}
@@ -3978,7 +4508,100 @@ export function MemoryPalaceViewPage() {
             </Canvas>
           </div>
         </div>
+        <div className="pointer-events-auto flex justify-end gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setExportDialogOpen(true)}
+          >
+            Export
+          </Button>
+          <Button
+            size="sm"
+            variant={saveStatus === 'error' ? 'destructive' : 'default'}
+            onClick={handleSaveScene}
+            disabled={saveStatus === 'saving'}
+          >
+            {saveStatus === 'saving'
+              ? 'Saving...'
+              : saveStatus === 'saved'
+                ? 'Saved'
+                : saveStatus === 'error'
+                  ? 'Retry Save'
+                  : 'Save'}
+          </Button>
+        </div>
       </div>
+
+      <Dialog open={exportDialogOpen} onOpenChange={setExportDialogOpen}>
+        <DialogContent className="w-[22rem]">
+          <DialogHeader>
+            <DialogTitle>Export Scene</DialogTitle>
+            <DialogDescription>
+              Objects always export; floors and surfaces are optional.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 px-4 pb-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">Export Type</span>
+              <select
+                value={exportFormat}
+                onChange={(event) => setExportFormat(event.target.value as 'stl')}
+                className="h-9 border border-border bg-background px-2 text-sm outline-none"
+              >
+                <option value="stl">STL</option>
+              </select>
+            </label>
+
+            <div className="flex flex-col gap-2">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeFloor}
+                  onChange={(event) => setExportIncludeFloor(event.target.checked)}
+                  className="size-4 accent-primary"
+                />
+                Floor
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeDrawnSurfaces}
+                  onChange={(event) =>
+                    setExportIncludeDrawnSurfaces(event.target.checked)
+                  }
+                  className="size-4 accent-primary"
+                />
+                Drawn Surfaces
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeSelectedSurfaces}
+                  onChange={(event) =>
+                    setExportIncludeSelectedSurfaces(event.target.checked)
+                  }
+                  className="size-4 accent-primary"
+                />
+                Selected Surfaces
+              </label>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setExportDialogOpen(false)}
+                disabled={exportBusy}
+              >
+                Cancel
+              </Button>
+              <Button onClick={handleExportScene} disabled={exportBusy}>
+                {exportBusy ? 'Exporting...' : 'Export'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <div className="pointer-events-none absolute top-2 left-2 z-10 w-[18rem] max-w-[calc(100vw-1rem)]">
         <div className="pointer-events-auto border border-border bg-background/88 p-2 backdrop-blur">
@@ -4238,6 +4861,20 @@ export function MemoryPalaceViewPage() {
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div className="mb-2">
+                <div className="mb-1 text-xs text-muted-foreground">Height</div>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.05"
+                  value={floorGridObject.floor.height}
+                  onChange={(event) =>
+                    updateFloorHeightById(floorGridObject.id, event.target.value)
+                  }
+                  className="h-9 w-full border border-border bg-background px-2 text-sm outline-none"
+                />
               </div>
 
               <div
@@ -4636,7 +5273,14 @@ export function MemoryPalaceViewPage() {
           WebkitTouchCallout: 'none',
         }}
       >
-        <Canvas camera={{ position: [3, 3, 3], fov: 55, near: 0.01, far: 5000 }}>
+        <Canvas
+          camera={{
+            position: initialCameraPositionRef.current,
+            fov: 55,
+            near: 0.01,
+            far: 5000,
+          }}
+        >
           <color attach="background" args={['#111111']} />
           <SceneCameraRig
             cameraMode={cameraMode}
@@ -4668,6 +5312,7 @@ export function MemoryPalaceViewPage() {
           <CameraControls
             activeTool={selectedTool}
             cameraOrientationRef={cameraOrientationRef}
+            cameraPositionRef={cameraPositionRef}
             cameraTargetRef={cameraTargetRef}
             onSelectedSurfaceFacePick={toggleSelectedSurfaceFace}
             penProjectionSurfaceId={penProjectionSurfaceId}

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -22,6 +22,19 @@ class MemoryPalaceBase(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str = ""
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        # The name doubles as the palace's directory name on disk.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Name must not be blank.")
+        if any(character in stripped for character in ("/", "\\", "\x00")):
+            raise ValueError("Name must not contain path separators.")
+        if stripped.startswith("."):
+            raise ValueError("Name must not start with a dot.")
+        return stripped
+
 
 class MemoryPalaceCreate(MemoryPalaceBase):
     pass
@@ -39,6 +52,12 @@ class MemoryPalaceRecord(MemoryPalaceBase):
 class MemoryPalaceListItem(MemoryPalaceBase):
     created_at: datetime
     updated_at: datetime
+
+
+class MemoryPalaceAssetInfo(BaseModel):
+    asset_id: str
+    file_name: str
+    format: Literal["stl", "glb", "fbx"]
 
 
 class RoutineTaskBase(BaseModel):

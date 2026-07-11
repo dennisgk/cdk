@@ -51,7 +51,7 @@ export function formatApiErrorDetail(detail: unknown): string {
   return 'Request failed.'
 }
 
-function withAuthHeaders(headers: HeadersInit = {}) {
+export function withAuthHeaders(headers: HeadersInit = {}) {
   const token = getAccessToken()
   return token
     ? {

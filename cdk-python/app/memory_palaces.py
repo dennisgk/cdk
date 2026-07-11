@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9,6 +12,7 @@ from fastapi import HTTPException, status
 
 from .db import BASE_DIR, Database
 from .schemas import (
+    MemoryPalaceAssetInfo,
     MemoryPalaceCreate,
     MemoryPalaceListItem,
     MemoryPalaceRecord,
@@ -16,6 +20,22 @@ from .schemas import (
 )
 
 MEMORY_PALACES_DATA_DIR = BASE_DIR / "data" / "memory_palace"
+SCENE_FILE_NAME = "palace.json"
+UPLOADS_DIR_NAME = "uploads"
+SCENE_SCHEMA_VERSION = 1
+MAX_SCENE_BYTES = 10 * 1024 * 1024
+MAX_ASSET_BYTES = 50 * 1024 * 1024
+ASSET_FORMATS = ("stl", "glb", "fbx")
+ASSET_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
+def default_scene_file() -> dict:
+    return {
+        "schemaVersion": SCENE_SCHEMA_VERSION,
+        "savedAt": None,
+        "editor": None,
+        "scene": {"objects": []},
+    }
 
 
 def now_utc() -> datetime:
@@ -120,6 +140,13 @@ class MemoryPalaceStore:
         with self.database.connect() as connection:
             connection.execute("DELETE FROM memory_palaces WHERE name = ?", (name,))
 
+    def touch_memory_palace(self, name: str) -> None:
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE memory_palaces SET updated_at = ? WHERE name = ?",
+                (now_utc().isoformat(), name),
+            )
+
     @staticmethod
     def _row_to_record(row) -> MemoryPalaceRecord:
         return MemoryPalaceRecord(
@@ -188,3 +215,121 @@ class MemoryPalaceManager:
         self.store.delete_memory_palace(name)
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)
+
+    def get_scene(self, name: str) -> dict:
+        self.get_memory_palace(name)
+        scene_path = memory_palace_dir(name) / SCENE_FILE_NAME
+        if not scene_path.is_file():
+            return default_scene_file()
+        try:
+            return json.loads(scene_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Scene file could not be read.",
+            ) from exc
+
+    def save_scene(self, name: str, payload: dict) -> dict:
+        self.get_memory_palace(name)
+        self._validate_scene_payload(payload)
+        payload["savedAt"] = now_utc().isoformat()
+
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_SCENE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Scene is too large.",
+            )
+
+        palace_dir = memory_palace_dir(name)
+        palace_dir.mkdir(parents=True, exist_ok=True)
+        scene_path = palace_dir / SCENE_FILE_NAME
+        temp_path = palace_dir / f"{SCENE_FILE_NAME}.tmp"
+        temp_path.write_text(encoded, "utf-8")
+        temp_path.replace(scene_path)
+
+        self._sweep_unreferenced_assets(name, payload)
+        self.store.touch_memory_palace(name)
+        return payload
+
+    def save_asset(self, name: str, file_name: str, data: bytes) -> MemoryPalaceAssetInfo:
+        self.get_memory_palace(name)
+        extension = Path(file_name).suffix.lstrip(".").lower()
+        if extension not in ASSET_FORMATS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unsupported asset type: {file_name}",
+            )
+        if len(data) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Asset file is empty.",
+            )
+        if len(data) > MAX_ASSET_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Asset file is too large.",
+            )
+
+        asset_id = hashlib.sha256(data).hexdigest()[:16]
+        uploads_dir = memory_palace_dir(name) / UPLOADS_DIR_NAME
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        asset_path = uploads_dir / f"{asset_id}.{extension}"
+        if not asset_path.exists():
+            asset_path.write_bytes(data)
+        return MemoryPalaceAssetInfo(
+            asset_id=asset_id,
+            file_name=file_name,
+            format=extension,
+        )
+
+    def get_asset_path(self, name: str, asset_id: str) -> Path:
+        self.get_memory_palace(name)
+        if not ASSET_ID_PATTERN.fullmatch(asset_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Asset was not found.",
+            )
+        uploads_dir = memory_palace_dir(name) / UPLOADS_DIR_NAME
+        for extension in ASSET_FORMATS:
+            candidate = uploads_dir / f"{asset_id}.{extension}"
+            if candidate.is_file():
+                return candidate
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Asset was not found.",
+        )
+
+    @staticmethod
+    def _validate_scene_payload(payload: dict) -> None:
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Scene payload must be an object.",
+            )
+        if not isinstance(payload.get("schemaVersion"), int):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Scene payload is missing a schemaVersion.",
+            )
+        scene = payload.get("scene")
+        if not isinstance(scene, dict) or not isinstance(scene.get("objects"), list):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Scene payload must contain scene.objects.",
+            )
+
+    def _sweep_unreferenced_assets(self, name: str, payload: dict) -> None:
+        uploads_dir = memory_palace_dir(name) / UPLOADS_DIR_NAME
+        if not uploads_dir.is_dir():
+            return
+        referenced: set[str] = set()
+        for entry in payload["scene"]["objects"]:
+            if not isinstance(entry, dict):
+                continue
+            imported = entry.get("importedModel")
+            if isinstance(imported, dict) and isinstance(imported.get("assetId"), str):
+                referenced.add(imported["assetId"])
+        for asset_file in uploads_dir.iterdir():
+            if asset_file.is_file() and asset_file.stem not in referenced:
+                asset_file.unlink(missing_ok=True)

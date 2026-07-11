@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,12 +11,17 @@ from fastapi.responses import FileResponse, Response
 from .config import get_config, load_config
 from .db import BASE_DIR
 from .db import Database
-from .memory_palaces import MemoryPalaceManager, MemoryPalaceStore
+from .memory_palaces import (
+    MAX_SCENE_BYTES,
+    MemoryPalaceManager,
+    MemoryPalaceStore,
+)
 from .pipelines import PipelineManager, RoutineTaskPipelineFacade
 from .routine_tasks import RoutineTaskManager, RoutineTaskStore
 from .schemas import (
     AuthenticatedUser,
     LoginRequest,
+    MemoryPalaceAssetInfo,
     MemoryPalaceCreate,
     MemoryPalaceListItem,
     MemoryPalaceRecord,
@@ -134,6 +140,64 @@ def delete_memory_palace(
 ) -> Response:
     memory_palace_manager.delete_memory_palace(name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/memory-palaces/{name}/scene")
+def get_memory_palace_scene(
+    name: str,
+    _: str = Depends(get_current_subject),
+) -> dict:
+    return memory_palace_manager.get_scene(name)
+
+
+@app.put("/api/memory-palaces/{name}/scene")
+async def save_memory_palace_scene(
+    name: str,
+    request: Request,
+    _: str = Depends(get_current_subject),
+) -> dict:
+    body = await request.body()
+    if len(body) > MAX_SCENE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Scene is too large.",
+        )
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Scene payload must be valid JSON.",
+        ) from exc
+    return memory_palace_manager.save_scene(name, payload)
+
+
+@app.post(
+    "/api/memory-palaces/{name}/assets",
+    response_model=MemoryPalaceAssetInfo,
+)
+async def upload_memory_palace_asset(
+    name: str,
+    file_name: str,
+    request: Request,
+    _: str = Depends(get_current_subject),
+) -> MemoryPalaceAssetInfo:
+    data = await request.body()
+    return memory_palace_manager.save_asset(name, file_name, data)
+
+
+@app.get("/api/memory-palaces/{name}/assets/{asset_id}")
+def get_memory_palace_asset(
+    name: str,
+    asset_id: str,
+    _: str = Depends(get_current_subject),
+) -> FileResponse:
+    asset_path = memory_palace_manager.get_asset_path(name, asset_id)
+    return FileResponse(
+        asset_path,
+        media_type="application/octet-stream",
+        filename=asset_path.name,
+    )
 
 
 @app.get("/api/routine-tasks", response_model=list[RoutineTaskListItem])
